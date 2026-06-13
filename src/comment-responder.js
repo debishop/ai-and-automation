@@ -1,4 +1,5 @@
 import { Client } from "pg";
+import { classifyPostType, SEED_COPY, FALLBACK_POST_TYPE } from "./seed-config.js";
 
 const VALID_TABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/;
 const GRAPH_VERSION = "v22.0";
@@ -241,4 +242,107 @@ export function filterEligibleComments({ comments, pageId, repliedIds, now, wind
     if (now - created > windowMs) return false; // last 24h only
     return true;
   });
+}
+
+/**
+ * Idempotent audit log for seed comments.
+ * One row per post id; a post is seeded with a comment exactly once, ever.
+ * Created the same lazy CREATE-TABLE-IF-NOT-EXISTS way as the reply store.
+ */
+export class PostgresCommentSeedStore {
+  constructor({ connectionString, table, timeoutMs = 10_000, clientFactory = (c) => new Client(c) }) {
+    if (!connectionString) throw new Error("Comment seed store requires a connection string");
+    if (!table) throw new Error("Comment seed store requires a table name");
+    this.table = quoteTableName(table);
+    this.client = clientFactory({
+      connectionString,
+      connectionTimeoutMillis: timeoutMs,
+      statement_timeout: timeoutMs,
+      query_timeout: timeoutMs,
+    });
+    this.connected = false;
+    this.schemaReady = false;
+  }
+
+  async connect() {
+    if (this.connected) return;
+    await this.client.connect();
+    this.connected = true;
+  }
+
+  async ensureSchema() {
+    if (this.schemaReady) return;
+    await this.connect();
+    await this.client.query(`
+      CREATE TABLE IF NOT EXISTS ${this.table} (
+        post_id TEXT PRIMARY KEY,
+        seed_comment_id TEXT,
+        post_type TEXT,
+        seeded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    this.schemaReady = true;
+  }
+
+  // True if this post id has already been seeded.
+  async hasSeed(postId) {
+    await this.ensureSchema();
+    const result = await this.client.query(`SELECT 1 FROM ${this.table} WHERE post_id=$1`, [postId]);
+    return result.rowCount > 0;
+  }
+
+  // Records the seed audit row. ON CONFLICT keeps the one-seed-per-post guarantee
+  // even under concurrent/overlapping runs. Returns true if this call inserted.
+  async recordSeed({ postId, seedCommentId, postType }) {
+    await this.ensureSchema();
+    const result = await this.client.query(
+      `
+        INSERT INTO ${this.table} (post_id, seed_comment_id, post_type)
+        VALUES ($1,$2,$3)
+        ON CONFLICT (post_id) DO NOTHING
+      `,
+      [postId, seedCommentId, postType],
+    );
+    return result.rowCount === 1;
+  }
+
+  async close() {
+    if (!this.connected) return;
+    await this.client.end();
+    this.connected = false;
+  }
+}
+
+/**
+ * Self-serve seeding step for the Comment-Reply Window.
+ * Fetches the most-recent published post, classifies its type, selects the
+ * canonical seed copy, and posts it exactly once per post id (idempotent via the
+ * seed store). Text-only; the real-image policy is unchanged.
+ *
+ * Returns a structured outcome for logging. Never posts twice for the same post.
+ */
+export async function seedMostRecentPost({ client, store }) {
+  const posts = await client.listRecentPosts({ limit: 1 });
+  if (!posts.length) {
+    return { outcome: "no_post" };
+  }
+  const post = posts[0];
+  const postType = classifyPostType(post.message);
+  const seedText = SEED_COPY[postType] ?? SEED_COPY[FALLBACK_POST_TYPE];
+
+  if (await store.hasSeed(post.id)) {
+    return { outcome: "already_seeded", post_id: post.id, post_type: postType };
+  }
+
+  // createComment is the proven Graph-API write path used by the QA seeder.
+  const seedCommentId = await client.createComment(post.id, seedText);
+  // Record after the post so the audit row reflects a real Graph object.
+  // If a concurrent run beat us to it, the insert is a no-op (still one seed).
+  const inserted = await store.recordSeed({ postId: post.id, seedCommentId, postType });
+  return {
+    outcome: inserted ? "seeded" : "already_seeded",
+    post_id: post.id,
+    post_type: postType,
+    seed_comment_id: seedCommentId,
+  };
 }

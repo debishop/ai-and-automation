@@ -22,7 +22,9 @@ import { dirname } from "node:path";
 import {
   FacebookCommentClient,
   PostgresCommentReplyStore,
+  PostgresCommentSeedStore,
   filterEligibleComments,
+  seedMostRecentPost,
 } from "../src/comment-responder.js";
 
 function arg(flag) {
@@ -50,7 +52,22 @@ async function loadSecrets() {
     systemUserToken: secret("FACEBOOK_SYSTEM_USER_TOKEN"),
     databaseUrl: secret("DATABASE_URL"),
     repliesTable: process.env.FACEBOOK_COMMENT_REPLIES_TABLE || "public.facebook_comment_replies",
+    seedsTable: process.env.FACEBOOK_COMMENT_SEEDS_TABLE || "public.facebook_comment_seeds",
   };
+}
+
+// Self-serve seed step. Runs once per window firing; idempotent per post id so
+// reruns/overlaps never double-seed. Non-critical: a failure here is logged and
+// swallowed so the primary reply path always proceeds.
+async function runSeedStep({ client, seedStore }) {
+  try {
+    const result = await seedMostRecentPost({ client, store: seedStore });
+    console.log(JSON.stringify({ phase: "seed", ...result }, null, 2));
+    return result;
+  } catch (err) {
+    console.log(JSON.stringify({ phase: "seed", outcome: "error", error: err.message }, null, 2));
+    return { outcome: "error", error: err.message };
+  }
 }
 
 async function writeJson(path, payload) {
@@ -99,9 +116,17 @@ const includeIds = new Set((arg("--include-comment-ids") || "").split(",").map((
 
 const client = new FacebookCommentClient({ pageId: secrets.pageId, systemUserToken: secrets.systemUserToken });
 const store = new PostgresCommentReplyStore({ connectionString: secrets.databaseUrl, table: secrets.repliesTable });
+const seedStore = new PostgresCommentSeedStore({ connectionString: secrets.databaseUrl, table: secrets.seedsTable });
 
 try {
-  if (process.argv.includes("--list")) {
+  // Self-serve seeding: auto-seed the most-recent post once per window firing,
+  // before/alongside replies. Idempotent + graceful-degrade so it can never take
+  // down the reply path. `--seed-only` runs just this step (used by the CTO smoke).
+  const seedResult = await runSeedStep({ client, seedStore });
+
+  if (process.argv.includes("--seed-only")) {
+    console.log(JSON.stringify({ phase: "seed-only", seed: seedResult }, null, 2));
+  } else if (process.argv.includes("--list")) {
     const out = arg("--list");
     const eligible = await gatherEligible({ client, store, pageId: secrets.pageId, includeIds });
     await writeJson(out, { generated_run_id: randomUUID(), count: eligible.length, eligible });
@@ -157,8 +182,9 @@ try {
     if (logPath) await writeJson(logPath, summary);
     console.log(JSON.stringify(summary, null, 2));
   } else {
-    throw new Error("usage: --list <out.json> | --replies <replies.json> [--log <out.json>]");
+    throw new Error("usage: [--seed-only] | --list <out.json> | --replies <replies.json> [--log <out.json>]");
   }
 } finally {
   await store.close();
+  await seedStore.close();
 }
