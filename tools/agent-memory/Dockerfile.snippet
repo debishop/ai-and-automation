@@ -1,0 +1,9 @@
+# --- agent-memory CLI (Layer 0 work-log) -------------------------------------
+# Add to the agent base image Dockerfile. Replace the hand-placed
+# /usr/local/bin/agent-memory binary with a versioned, source-controlled install.
+#
+# Assumes the build context contains tools/agent-memory/ (this directory).
+COPY tools/agent-memory /opt/agent-memory
+RUN /opt/agent-memory/install.sh \
+    && agent-memory version
+# -----------------------------------------------------------------------------

@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+# agent-memory — Role work-log CLI for Paperclip agents (Layer 0 of para-memory-files).
+# Operates on $AGENT_HOME/memory.md + archive.md.
+# Usage: agent-memory <read|append|compact|init|version> [options]
+set -euo pipefail
+
+AGENT_MEMORY_VERSION="1.1.0"
+
+AGENT_HOME="${AGENT_HOME:-$HOME}"
+MEMORY_FILE="$AGENT_HOME/memory.md"
+ARCHIVE_FILE="$AGENT_HOME/archive.md"
+TODAY=$(date +%Y-%m-%d)
+
+MAX_ENTRIES=40
+KEEP_ENTRIES=10
+
+cmd="${1:-}"
+shift || true
+
+usage() {
+  cat <<'EOF'
+Usage: agent-memory <command> [options]
+
+Commands:
+  read [--n N]   Print ROLLING SUMMARY + last N RECENT LOG entries (default 10)
+  append         Read one structured entry from stdin, stamp date, append to RECENT LOG
+  compact        Move oldest entries to archive.md; emit them to stdout for summary update
+  init <role>    Seed memory.md from role template if absent (idempotent)
+  version        Print CLI version
+
+Roles (init): content-researcher, editorial-writer, fact-checker,
+  video-producer, cmo, cco, ceo, cto, engineer
+
+Operates on: $AGENT_HOME/memory.md + $AGENT_HOME/archive.md
+EOF
+  exit 1
+}
+
+count_entries() {
+  grep -c '^\[20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]\]' "$MEMORY_FILE" 2>/dev/null || true
+}
+
+cmd_read() {
+  local n=10
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --n) n="$2"; shift 2 ;;
+      --n=*) n="${1#--n=}"; shift ;;
+      *) echo "Unknown option: $1" >&2; usage ;;
+    esac
+  done
+
+  if [[ ! -f "$MEMORY_FILE" ]]; then
+    echo "No memory file at $MEMORY_FILE. Run: agent-memory init <role>" >&2
+    exit 1
+  fi
+
+  # Print header + ROLLING SUMMARY (everything up to and including ## RECENT LOG line)
+  awk '/^## RECENT LOG/{print; exit} {print}' "$MEMORY_FILE"
+  echo ""
+
+  # Print last N log entries
+  local entries
+  entries=$(grep '^\[20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]\]' "$MEMORY_FILE" 2>/dev/null || true)
+  if [[ -n "$entries" ]]; then
+    echo "$entries" | tail -"$n"
+  else
+    echo "(no log entries yet)"
+  fi
+}
+
+_do_compact() {
+  local quiet="${1:-}"
+  local count
+  count=$(count_entries)
+
+  if [[ "$count" -le "$KEEP_ENTRIES" ]]; then
+    [[ -z "$quiet" ]] && echo "Only $count entries — nothing to compact." >&2
+    return 0
+  fi
+
+  local to_archive=$(( count - KEEP_ENTRIES ))
+
+  local all_entries
+  all_entries=$(grep '^\[20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]\]' "$MEMORY_FILE")
+
+  local archived_entries
+  archived_entries=$(echo "$all_entries" | head -"$to_archive")
+
+  local kept_entries
+  kept_entries=$(echo "$all_entries" | tail -"$KEEP_ENTRIES")
+
+  # Append archived entries to archive.md
+  {
+    echo ""
+    echo "<!-- archived $(date -u +%Y-%m-%dT%H:%M:%SZ) -->"
+    echo "$archived_entries"
+  } >> "$ARCHIVE_FILE"
+
+  # Rebuild memory.md: header + ROLLING SUMMARY + marker + kept entries
+  local summary_block
+  summary_block=$(awk '/^## RECENT LOG/{exit} {print}' "$MEMORY_FILE")
+  local stamp
+  stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  {
+    printf '%s\n' "$summary_block"
+    echo "## RECENT LOG"
+    echo "<!-- SUMMARY-UPDATE-NEEDED: $to_archive entries archived $stamp -->"
+    echo "$kept_entries"
+  } > "${MEMORY_FILE}.tmp"
+  mv "${MEMORY_FILE}.tmp" "$MEMORY_FILE"
+
+  # Emit archived entries to stdout only when called directly (compact cmd), not from append
+  [[ -z "$quiet" ]] && echo "$archived_entries"
+
+  [[ -z "$quiet" ]] && echo "Compacted: $to_archive entries archived, $KEEP_ENTRIES kept." >&2
+}
+
+cmd_append() {
+  if [[ ! -f "$MEMORY_FILE" ]]; then
+    echo "No memory file at $MEMORY_FILE. Run: agent-memory init <role>" >&2
+    exit 1
+  fi
+
+  local entry
+  entry=$(cat)
+  if [[ -z "$entry" ]]; then
+    echo "Error: entry cannot be empty (pipe via stdin or heredoc)" >&2
+    exit 1
+  fi
+
+  echo "[${TODAY}] — ${entry}" >> "$MEMORY_FILE"
+
+  local count
+  count=$(count_entries)
+  if [[ "$count" -gt "$MAX_ENTRIES" ]]; then
+    echo "Entry count ($count) > $MAX_ENTRIES. Auto-compacting..." >&2
+    _do_compact quiet
+  fi
+}
+
+cmd_compact() {
+  if [[ ! -f "$MEMORY_FILE" ]]; then
+    echo "No memory file at $MEMORY_FILE. Run: agent-memory init <role>" >&2
+    exit 1
+  fi
+  _do_compact
+}
+
+cmd_init() {
+  local role="${1:-}"
+  if [[ -z "$role" ]]; then
+    echo "Error: role required. Usage: agent-memory init <role>" >&2
+    echo "Known roles: content-researcher, editorial-writer, fact-checker, video-producer, cmo, cco, ceo, cto, engineer" >&2
+    exit 1
+  fi
+
+  if [[ -f "$MEMORY_FILE" ]]; then
+    echo "Already exists: $MEMORY_FILE (idempotent — skipping)" >&2
+    exit 0
+  fi
+
+  mkdir -p "$AGENT_HOME"
+
+  case "$role" in
+    content-researcher|researcher)
+      cat > "$MEMORY_FILE" <<'TEMPLATE'
+Content Researcher — Memory
+<!-- READ: ROLLING SUMMARY + last 10 RECENT LOG entries only. Never read archive.md. -->
+
+## ROLLING SUMMARY
+- Pillars covered: (none yet)
+- Topics done (don't re-research): (none yet)
+- Topics in-progress: (none yet)
+- Reliable sources: (none yet)
+- Unreliable sources (avoid): (none yet)
+- Known gaps: (none yet)
+- Standing editorial constraints: (none yet)
+
+---
+
+## RECENT LOG
+<!-- Append-only. Newest at bottom. >40 entries triggers auto-compact. -->
+<!-- Format: [YYYY-MM-DD] — Topic → Pillar · Done · Key sources · Verdict on sourcing · Open threads · Handoff -->
+TEMPLATE
+      ;;
+    editorial-writer|writer)
+      cat > "$MEMORY_FILE" <<'TEMPLATE'
+Editorial Writer — Memory
+<!-- READ: ROLLING SUMMARY + last 10 RECENT LOG entries only. Never read archive.md. -->
+
+## ROLLING SUMMARY
+- Pieces published: (none yet)
+- Active drafts + stage: (none yet)
+- Voice/style rules locked: (none yet)
+- Recurring structures that work: (none yet)
+- Do-not-repeat angles: (none yet)
+- Standing constraints (Meta originality, sensitivity): (none yet)
+
+---
+
+## RECENT LOG
+<!-- Append-only. Newest at bottom. >40 entries triggers auto-compact. -->
+<!-- Format: [YYYY-MM-DD] — Piece → Pillar · Stage · Word count/format · Source brief from Researcher · Fact-Check status · Open edits · Handoff -->
+TEMPLATE
+      ;;
+    fact-checker|checker)
+      cat > "$MEMORY_FILE" <<'TEMPLATE'
+Fact-Checker — Memory
+<!-- READ: ROLLING SUMMARY + last 10 RECENT LOG entries only. Never read archive.md. -->
+
+## ROLLING SUMMARY
+- Claims verified count: 0
+- Standing disputed facts + resolution: (none yet)
+- Trusted vs rejected sources: (none yet)
+- Recurring error patterns by author: (none yet)
+- Sensitivity flags: (none yet)
+
+---
+
+## RECENT LOG
+<!-- Append-only. Newest at bottom. >40 entries triggers auto-compact. -->
+<!-- Format: [YYYY-MM-DD] — Item → Claims checked · Verdict (verified/corrected/rejected) · Authoritative sources · Corrections issued · Unresolved disputes · Handoff -->
+<!-- Only Fact-Checker may stamp "verified". -->
+TEMPLATE
+      ;;
+    video-producer|producer|video)
+      cat > "$MEMORY_FILE" <<'TEMPLATE'
+Video & Media Producer — Memory
+<!-- READ: ROLLING SUMMARY + last 10 RECENT LOG entries only. Never read archive.md. -->
+
+## ROLLING SUMMARY
+- Assets/series produced: (none yet)
+- Templates & formats locked: (none yet)
+- Platform specs (aspect/length): (none yet)
+- Reusable b-roll/music library refs: (none yet)
+- Rejected formats: (none yet)
+- Brand visual constraints: (none yet)
+
+---
+
+## RECENT LOG
+<!-- Append-only. Newest at bottom. >40 entries triggers auto-compact. -->
+<!-- Format: [YYYY-MM-DD] — Asset → Piece it supports · Format/platform · Status · Assets used · Approvals · Open production threads · Handoff -->
+TEMPLATE
+      ;;
+    cmo|marketing)
+      cat > "$MEMORY_FILE" <<'TEMPLATE'
+CMO — Memory
+<!-- READ: ROLLING SUMMARY + last 10 RECENT LOG entries only. Never read archive.md. -->
+
+## ROLLING SUMMARY
+- Strategy + pillars: (none yet)
+- Channel performance highlights: (none yet)
+- Standing brand/editorial policy: (none yet)
+- Pending approvals: (none yet)
+- Cross-team blockers: (none yet)
+
+---
+
+## RECENT LOG
+<!-- Append-only. Newest at bottom. >40 entries triggers auto-compact. -->
+<!-- Format: [YYYY-MM-DD] — Decision/Review → Area · Decision · Driver/metric · Affected roles · Open threads · Handoff -->
+TEMPLATE
+      ;;
+    cto)
+      cat > "$MEMORY_FILE" <<'TEMPLATE'
+CTO — Memory
+<!-- READ: ROLLING SUMMARY + last 10 RECENT LOG entries only. Never read archive.md. -->
+
+## ROLLING SUMMARY
+- Systems owned + live status: (none yet)
+- Standing infra/integration decisions: (none yet)
+- Live IDs/credentials locations (never values): (none yet)
+- Recurring failure modes: (none yet)
+- Delegations in flight: (none yet)
+
+---
+
+## RECENT LOG
+<!-- Append-only. Newest at bottom. >40 entries triggers auto-compact. -->
+<!-- Format: [YYYY-MM-DD] — Work → System · Change/decision · Verified live? · Delegated to · Risk/rollback · Open threads -->
+TEMPLATE
+      ;;
+    cco)
+      cat > "$MEMORY_FILE" <<'TEMPLATE'
+CCO — Memory
+<!-- READ: ROLLING SUMMARY + last 10 RECENT LOG entries only. Never read archive.md. -->
+
+## ROLLING SUMMARY
+- Content strategy + pillars: (none yet)
+- Channel performance highlights: (none yet)
+- Standing editorial/brand policy: (none yet)
+- Approvals pending: (none yet)
+- Cross-team blockers: (none yet)
+
+---
+
+## RECENT LOG
+<!-- Append-only. Newest at bottom. >40 entries triggers auto-compact. -->
+<!-- Format: [YYYY-MM-DD] — Decision/Review → Area · Decision · Driver/metric · Affected roles · Open threads · Handoff -->
+TEMPLATE
+      ;;
+    ceo)
+      cat > "$MEMORY_FILE" <<'TEMPLATE'
+CEO — Memory
+<!-- READ: ROLLING SUMMARY + last 10 RECENT LOG entries only. Never read archive.md. -->
+
+## ROLLING SUMMARY
+- Company goals + status: (none yet)
+- Standing directives: (none yet)
+- Open board items: (none yet)
+- Delegations in flight: (none yet)
+
+---
+
+## RECENT LOG
+<!-- Append-only. Newest at bottom. >40 entries triggers auto-compact. -->
+<!-- Format: [YYYY-MM-DD] — Directive/Review → Area · Decision · Rationale · Owner · Open threads -->
+TEMPLATE
+      ;;
+    engineer)
+      cat > "$MEMORY_FILE" <<'TEMPLATE'
+Engineer — Memory
+<!-- READ: ROLLING SUMMARY + last 10 RECENT LOG entries only. Never read archive.md. -->
+
+## ROLLING SUMMARY
+- Systems/services owned: (none yet)
+- Standing technical decisions: (none yet)
+- Live integration IDs/locations (never values): (none yet)
+- Known failure modes + mitigations: (none yet)
+- Delegations in flight: (none yet)
+
+---
+
+## RECENT LOG
+<!-- Append-only. Newest at bottom. >40 entries triggers auto-compact. -->
+<!-- Format: [YYYY-MM-DD] — Work → System · Change/decision · Tests passing? · PR/commit · Risk/rollback · Open threads -->
+TEMPLATE
+      ;;
+    *)
+      # Generic executive fallback
+      local title="${role}"
+      cat > "$MEMORY_FILE" <<TEMPLATE
+${title^} — Memory
+<!-- READ: ROLLING SUMMARY + last 10 RECENT LOG entries only. Never read archive.md. -->
+
+## ROLLING SUMMARY
+- Domain owned: (none yet)
+- Standing decisions: (none yet)
+- KPIs/status: (none yet)
+- Delegations: (none yet)
+
+---
+
+## RECENT LOG
+<!-- Append-only. Newest at bottom. >40 entries triggers auto-compact. -->
+<!-- Format: [YYYY-MM-DD] — Work → Area · Decision/output · Evidence · Handoff · Open threads -->
+TEMPLATE
+      ;;
+  esac
+
+  echo "Initialized $MEMORY_FILE for role: $role" >&2
+}
+
+case "$cmd" in
+  read)    cmd_read "$@" ;;
+  append)  cmd_append "$@" ;;
+  compact) cmd_compact "$@" ;;
+  init)    cmd_init "$@" ;;
+  version|--version|-V) echo "agent-memory $AGENT_MEMORY_VERSION" ;;
+  ""|--help|-h) usage ;;
+  *) echo "Unknown command: $cmd" >&2; usage ;;
+esac
