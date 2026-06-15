@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>The Lens — AI &amp; Automation | Free Newsletter</title>
+  <meta name="description" content="Weekly AI tools & automation playbooks. Subscribe free and get The AI Tools Starter Pack — 12 AI tools that replace a 5-person team." />
+  <meta property="og:title" content="The Lens — AI &amp; Automation" />
+  <meta property="og:description" content="Get The AI Tools Starter Pack — 12 AI tools that replace a 5-person team. Free weekly newsletter." />
+  <style>
+    :root{--bg:#0b1020;--card:#141b33;--accent:#5b8cff;--accent2:#37e0c4;--text:#eef2ff;--muted:#9aa6c7}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:radial-gradient(1200px 600px at 70% -10%,#1c2854,var(--bg));color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+    .card{background:var(--card);border:1px solid #25315c;border-radius:18px;max-width:560px;width:100%;padding:40px;box-shadow:0 20px 60px rgba(0,0,0,.45)}
+    .eyebrow{letter-spacing:.18em;text-transform:uppercase;font-size:12px;color:var(--accent2);font-weight:700;margin-bottom:14px}
+    h1{font-size:30px;line-height:1.15;margin:0 0 14px}
+    .lead{color:var(--muted);font-size:17px;line-height:1.55;margin:0 0 22px}
+    .magnet{background:#0f1730;border:1px dashed #34406e;border-radius:12px;padding:16px 18px;margin:0 0 24px;font-size:15px}
+    .magnet b{color:var(--accent2)}
+    form{display:flex;gap:10px;flex-wrap:wrap}
+    input[type=email]{flex:1 1 240px;min-width:0;padding:14px 16px;border-radius:10px;border:1px solid #34406e;background:#0c1430;color:var(--text);font-size:16px}
+    input[type=email]:focus{outline:2px solid var(--accent);border-color:var(--accent)}
+    button{padding:14px 22px;border:0;border-radius:10px;background:linear-gradient(120deg,var(--accent),var(--accent2));color:#06122b;font-weight:800;font-size:16px;cursor:pointer}
+    button:disabled{opacity:.6;cursor:default}
+    .msg{margin-top:16px;font-size:15px;min-height:22px}
+    .ok{color:var(--accent2)} .err{color:#ff8b8b}
+    .fine{margin-top:26px;color:var(--muted);font-size:12.5px;line-height:1.5}
+    a{color:var(--accent)}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="eyebrow">The Lens — AI &amp; Automation</div>
+    <h1>12 AI tools that replace a 5-person team.</h1>
+    <p class="lead">Join the free weekly newsletter for operators who want to do more with AI &amp; automation — no fluff, just tools and playbooks you can use this week.</p>
+    <div class="magnet">📦 Subscribe and get <b>The AI Tools Starter Pack</b> — our hand-picked stack of 12 AI tools (with exactly how we use each one) delivered to your inbox.</div>
+    <form id="signup">
+      <input id="email" type="email" name="email" placeholder="you@example.com" required autocomplete="email" aria-label="Email address" />
+      <button id="submit" type="submit">Get the Starter Pack</button>
+    </form>
+    <div id="msg" class="msg" role="status" aria-live="polite"></div>
+    <p class="fine">
+      We send one weekly email plus the Starter Pack. Unsubscribe anytime. We never sell your email.
+      <br />Some tools in the Starter Pack are affiliate partners — if you sign up through our links we may earn a commission, at no cost to you. <em>(Disclosure pending Compliance review.)</em>
+    </p>
+  </main>
+
+  <script>
+    // Public, client-safe Supabase publishable key (RLS allows anonymous INSERT only).
+    var SUPABASE_URL = "https://otbjpwsrndcauplqulls.supabase.co";
+    var SUPABASE_KEY = "sb_publishable_95zlxX6NHgLFGYZCl_q0hg_4KxzuGuf";
+    var ENDPOINT = SUPABASE_URL + "/rest/v1/newsletter_subscribers";
+
+    var form = document.getElementById("signup");
+    var msg = document.getElementById("msg");
+    var btn = document.getElementById("submit");
+
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var email = document.getElementById("email").value.trim();
+      if (!email) return;
+      btn.disabled = true; msg.textContent = "Signing you up…"; msg.className = "msg";
+      fetch(ENDPOINT, {
+        method: "POST",
+        headers: { "apikey": SUPABASE_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ email: email, source: "the-lens-fb" })
+      }).then(function (r) {
+        if (r.status === 201 || r.status === 409) {
+          msg.textContent = "✅ You're in! Check your inbox for The AI Tools Starter Pack.";
+          msg.className = "msg ok"; form.reset();
+        } else {
+          return r.text().then(function (t) { throw new Error(t || r.status); });
+        }
+      }).catch(function () {
+        msg.textContent = "Something went wrong — please try again in a moment.";
+        msg.className = "msg err";
+      }).finally(function () { btn.disabled = false; });
+    });
+  </script>
+</body>
+</html>
