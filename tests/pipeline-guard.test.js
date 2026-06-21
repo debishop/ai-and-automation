@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
   evaluateGate,
@@ -110,4 +112,32 @@ test("run-195 scenario: cancelled gate + empty publish => whole chain stays fail
 
   const logStep = resolveDedupLogStepDisposition({ publishStep });
   assert.equal(logStep.status, STEP_BLOCKED, "Step 10 must not be done");
+});
+
+// THEAAAAA-381: the guarded Step 9/10 templates only ever reach `done` via exit 0 of the guard
+// CLI. These assert the CLI-level contract the generated step body relies on — the same boundary
+// a step agent crosses before it is allowed to set itself `done`.
+const GUARD_CLI = fileURLToPath(new URL("../scripts/pipeline-guard-check.mjs", import.meta.url));
+const runGuard = (...argv) => spawnSync(process.execPath, [GUARD_CLI, ...argv], { encoding: "utf8" });
+
+test("CLI gate: a cancelled Step 8.5 forces publish step to blocked (exit 1)", () => {
+  const r = runGuard("publish", "--gate-status", "cancelled", "--artifact", JSON.stringify(REAL_ARTIFACT));
+  assert.equal(r.status, 1, "cancelled gate must exit non-zero so the step cannot go done");
+  assert.match(r.stdout, /"status": "blocked"/);
+});
+
+test("CLI gate: gate passed but empty artifact forces publish step to blocked (the run-195 defect)", () => {
+  const r = runGuard("publish", "--gate-status", "done", "--artifact", "{}");
+  assert.equal(r.status, 1);
+});
+
+test("CLI gate: dedup-log blocks (exit 1) when the publish artifact is absent", () => {
+  const r = runGuard("dedup-log", "--artifact", "{}");
+  assert.equal(r.status, 1);
+});
+
+test("CLI gate: a real gate + real artifact is the only path to done (exit 0)", () => {
+  const r = runGuard("publish", "--gate-status", "done", "--artifact", JSON.stringify(REAL_ARTIFACT));
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /"status": "done"/);
 });
