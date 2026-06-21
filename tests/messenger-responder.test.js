@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   FacebookMessengerClient,
+  PostgresMessengerReplyStore,
   filterEligibleConversations,
   WELCOME_REPLY,
 } from "../src/messenger-responder.js";
@@ -118,4 +119,106 @@ test("listConversations requests inlined messages with from/created_time and an 
   assert.match(calls[0].url, /\/conversations\?platform=messenger/);
   assert.match(decodeURIComponent(calls[0].url), /messages\.limit\(\d+\)\{id,created_time,from,message\}/);
   assert.ok(calls[0].opts.signal);
+});
+
+// --- Reply store: claim/retry idempotency (THEAAAAA-386) ---
+
+// In-memory pg double that models the table semantics the store relies on:
+// PRIMARY KEY (psid), INSERT ... ON CONFLICT DO UPDATE ... WHERE outcome='failed',
+// and the outcome-filtered SELECT. Faithful enough to prove re-claim behavior
+// without a live Postgres.
+function makeFakeClient() {
+  const rows = new Map(); // psid -> row
+  return {
+    rows,
+    async connect() {},
+    async end() {},
+    async query(sql, params = []) {
+      const text = sql.replace(/\s+/g, " ").trim();
+      if (/^CREATE TABLE/i.test(text)) return { rowCount: 0, rows: [] };
+      if (/^SELECT psid FROM/i.test(text)) {
+        const out = [...rows.values()].filter((r) => r.outcome === "claimed" || r.outcome === "replied");
+        return { rowCount: out.length, rows: out.map((r) => ({ psid: r.psid })) };
+      }
+      if (/^INSERT INTO/i.test(text)) {
+        const [psid, conversationId, participantName, firstInboundTime, replyText, runId] = params;
+        const existing = rows.get(psid);
+        if (!existing) {
+          rows.set(psid, {
+            psid, conversation_id: conversationId, participant_name: participantName,
+            first_inbound_time: firstInboundTime, reply_text: replyText, outcome: "claimed", run_id: runId,
+          });
+          return { rowCount: 1, rows: [] };
+        }
+        // ON CONFLICT: re-claim only when the existing row is 'failed' and the guard is present.
+        if (/DO UPDATE/i.test(text) && /outcome='failed'/i.test(text) && existing.outcome === "failed") {
+          Object.assign(existing, {
+            outcome: "claimed", run_id: runId, conversation_id: conversationId,
+            participant_name: participantName, first_inbound_time: firstInboundTime, reply_text: replyText,
+          });
+          return { rowCount: 1, rows: [] };
+        }
+        return { rowCount: 0, rows: [] }; // DO NOTHING, or guard not matched (claimed/replied)
+      }
+      if (/SET outcome='replied'/i.test(text)) {
+        const [psid, messageId, runId] = params;
+        const r = rows.get(psid);
+        if (r && r.run_id === runId) { r.outcome = "replied"; r.message_id = messageId; return { rowCount: 1, rows: [] }; }
+        return { rowCount: 0, rows: [] };
+      }
+      if (/SET outcome='failed'/i.test(text)) {
+        const [psid, runId, reason] = params;
+        const r = rows.get(psid);
+        if (r && r.run_id === runId) { r.outcome = "failed"; r.payload = { error: reason }; return { rowCount: 1, rows: [] }; }
+        return { rowCount: 0, rows: [] };
+      }
+      return { rowCount: 0, rows: [] };
+    },
+  };
+}
+
+function newStore(fake) {
+  return new PostgresMessengerReplyStore({
+    connectionString: "postgres://fake",
+    table: "messenger_welcomes",
+    clientFactory: () => fake,
+  });
+}
+
+const claimArgs = (psid, runId) => ({
+  psid, conversationId: "t1", participantName: "Reader",
+  firstInboundTime: new Date(0).toISOString(), replyText: WELCOME_REPLY, runId,
+});
+
+test("a failed PSID re-qualifies and is re-claimable on the next run", async () => {
+  const store = newStore(makeFakeClient());
+
+  // Run 1: claim succeeds, then send fails (e.g. pages_messaging code 10).
+  assert.equal(await store.claim(claimArgs("A", "run1")), true);
+  await store.markFailed({ psid: "A", runId: "run1", reason: "code 10 pages_messaging" });
+
+  // A failed PSID is NOT counted as welcomed → it re-qualifies as eligible.
+  assert.equal((await store.loadWelcomedPsids()).has("A"), false);
+
+  // Run 2: the previously-failed row is re-claimable (the bug: this used to return false).
+  assert.equal(await store.claim(claimArgs("A", "run2")), true);
+});
+
+test("a replied PSID is welcomed forever and never re-sends", async () => {
+  const store = newStore(makeFakeClient());
+
+  assert.equal(await store.claim(claimArgs("B", "run1")), true);
+  await store.markReplied({ psid: "B", messageId: "mid.1", runId: "run1", payload: {} });
+
+  // Counted as welcomed, and a subsequent claim is rejected (no duplicate send).
+  assert.equal((await store.loadWelcomedPsids()).has("B"), true);
+  assert.equal(await store.claim(claimArgs("B", "run2")), false);
+});
+
+test("a freshly claimed (in-flight) PSID cannot be re-claimed by an overlapping run", async () => {
+  const store = newStore(makeFakeClient());
+
+  assert.equal(await store.claim(claimArgs("C", "run1")), true);
+  // Still 'claimed' (not failed) → overlapping run must not double-welcome.
+  assert.equal(await store.claim(claimArgs("C", "run2")), false);
 });
