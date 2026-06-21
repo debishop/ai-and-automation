@@ -23,13 +23,23 @@ export const SEED_COPY = {
 export const FALLBACK_POST_TYPE = "generic";
 
 /**
+ * Genuine weekly-roundup intent only. We deliberately do NOT match the bare
+ * tokens `weekly` or `this week`: AI-news copy routinely says "weekly active
+ * users" or "earlier this week", which previously mis-routed news/tool posts to
+ * the recap seed (THEAAAAA-379). Require an explicit recap/round-up phrasing, a
+ * possessive "this week's …" framing, or "weekly <roundup-noun>".
+ */
+const RECAP_SIGNAL =
+  /recap|round[ -]?up|this week'?s|weekly (recap|round[ -]?up|digest|rundown|wrap|edition|highlights)/;
+
+/**
  * Classify a post's message into one of the SEED_COPY keys.
  * Order matters: more specific signals are checked before broad ones.
  * Returns FALLBACK_POST_TYPE ("generic") when nothing matches.
  */
 export function classifyPostType(message) {
   const m = (message || "").toLowerCase();
-  if (/recap|this week|round ?up|weekly/.test(m)) return "recap";
+  if (RECAP_SIGNAL.test(m)) return "recap";
   if (/prompt/.test(m)) return "prompt";
   if (/poll|this or that|vote|would you rather/.test(m)) return "poll";
   if (/tool|app|try |feature|launch|release/.test(m)) return "tool";
