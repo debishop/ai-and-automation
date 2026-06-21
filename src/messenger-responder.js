@@ -169,6 +169,13 @@ export class PostgresMessengerReplyStore {
   }
 
   // Atomically claim a PSID so concurrent/duplicate runs cannot double-welcome.
+  //
+  // A fresh PSID is inserted as 'claimed'. A PSID that previously ended in
+  // 'failed' (e.g. send blocked while pages_messaging was pending — THEAAAAA-385)
+  // is RE-claimed: the WHERE guard flips only 'failed' rows back to 'claimed',
+  // so the next run can retry the send. Rows already 'claimed' or 'replied' do
+  // NOT match the guard, so this still never double-welcomes a live/active user.
+  // Either path yields rowCount === 1; a no-op conflict yields 0.
   async claim({ psid, conversationId, participantName, firstInboundTime, replyText, runId }) {
     await this.ensureSchema();
     const result = await this.client.query(
@@ -176,7 +183,15 @@ export class PostgresMessengerReplyStore {
         INSERT INTO ${this.table}
           (psid, conversation_id, participant_name, first_inbound_time, reply_text, outcome, run_id)
         VALUES ($1,$2,$3,$4,$5,'claimed',$6)
-        ON CONFLICT (psid) DO NOTHING
+        ON CONFLICT (psid) DO UPDATE SET
+          outcome='claimed',
+          run_id=EXCLUDED.run_id,
+          conversation_id=EXCLUDED.conversation_id,
+          participant_name=EXCLUDED.participant_name,
+          first_inbound_time=EXCLUDED.first_inbound_time,
+          reply_text=EXCLUDED.reply_text,
+          replied_at=NOW()
+        WHERE ${this.table}.outcome='failed'
       `,
       [psid, conversationId, participantName, firstInboundTime, replyText, runId],
     );
