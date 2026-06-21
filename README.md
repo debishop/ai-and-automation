@@ -36,6 +36,13 @@ node ./src/cli.js \
   --run-log ./logs/run.json
 ```
 
+## Pipeline fail-closed guard
+
+The agent-orchestrated step chain (parent run + 10 step issues) must never advance a step to
+`done` without proof of work. `src/pipeline-guard.js` enforces gate propagation, publish
+proof-of-work, and the dedup-log precondition; step agents run `scripts/pipeline-guard-check.mjs`
+to compute their allowed disposition. See [docs/pipeline-fail-closed.md](./docs/pipeline-fail-closed.md).
+
 ## Secrets
 
 - `FACEBOOK_PAGE_ID`

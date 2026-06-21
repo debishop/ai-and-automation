@@ -44,6 +44,56 @@ test("selectSeedCopy returns the canonical copy for the detected type", () => {
   assert.deepEqual(selectSeedCopy(""), { postType: "generic", seed: SEED_COPY.generic });
 });
 
+// --- THEAAAAA-379: tightened recap classifier with realistic news bodies ---
+
+test("classifyPostType: news bodies with 'weekly active users' / 'this week' do NOT mis-route to recap", () => {
+  // The exact trap from the THEAAAAA-109 go-live smoke: a SpaceX/Cursor news/tool
+  // post mentioning weekly active users. Bare `weekly`/`this week` must not win.
+  const newsTrap =
+    "Cursor just shipped a major release and SpaceX confirmed Starlink now serves " +
+    "more than 900 million weekly active users. Try the new feature today.";
+  assert.equal(classifyPostType(newsTrap), "tool");
+
+  // "earlier this week" framing in a launch post — still a tool, not a recap.
+  const launchThisWeek =
+    "Anthropic announced a new app earlier this week — here's what launched.";
+  assert.equal(classifyPostType(launchThisWeek), "tool");
+
+  // Generic news with the bare tokens but no roundup intent and no tool signal.
+  assert.equal(
+    classifyPostType("The model hit 100 million weekly active users this week."),
+    "generic",
+  );
+});
+
+test("classifyPostType: genuine weekly-roundup intent still classifies as recap", () => {
+  assert.equal(classifyPostType("This week's AI recap: the biggest stories"), "recap");
+  assert.equal(classifyPostType("Our weekly roundup of AI tools and launches"), "recap");
+  assert.equal(classifyPostType("Weekly round-up: everything that shipped"), "recap");
+  assert.equal(classifyPostType("This week's top AI moments, in one place"), "recap");
+  assert.equal(classifyPostType("The weekly digest of automation news"), "recap");
+});
+
+test("classifyPostType: one realistic body per post type routes correctly", () => {
+  assert.equal(
+    classifyPostType("New tool alert: this AI app just launched a feature you can try today."),
+    "tool",
+  );
+  assert.equal(
+    classifyPostType("The prompt that got us the cleanest output this sprint — copy it."),
+    "prompt",
+  );
+  assert.equal(
+    classifyPostType("Quick poll: would you rather automate email or meetings? Vote below."),
+    "poll",
+  );
+  assert.equal(classifyPostType("Weekly recap of what shipped in AI"), "recap");
+  assert.equal(
+    classifyPostType("A short reflection on where AI is heading, no links."),
+    "generic",
+  );
+});
+
 // --- Deliverable 2: idempotent seed store ---
 
 function fakeSeedClient({ existingPostIds = [] } = {}) {
