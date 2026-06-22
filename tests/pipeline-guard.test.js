@@ -10,7 +10,11 @@ import {
   resolvePublishStepDisposition,
   resolveDedupLogStepDisposition,
   isRealFacebookPostId,
+  isRealReelVideoId,
   isRealPermalink,
+  withinWordCap,
+  wordCount,
+  CAPTION_WORD_CAP,
   STEP_DONE,
   STEP_BLOCKED,
 } from "../src/pipeline-guard.js";
@@ -18,6 +22,15 @@ import {
 const REAL_ARTIFACT = {
   facebook_post_id: "1097492980106238_1234567890",
   permalink: "https://www.facebook.com/1097492980106238/posts/1234567890",
+};
+
+// THEAAAAA-434: a published Reel carries media_type + a bare-numeric reel video_id alongside the
+// {pageId}_{postId} feed id and the https permalink.
+const REAL_REEL_ARTIFACT = {
+  media_type: "reel",
+  video_id: "9988776655",
+  facebook_post_id: "1097492980106238_1234567890",
+  permalink: "https://www.facebook.com/reel/9988776655",
 };
 
 test("isRealFacebookPostId accepts page_post and bare numeric ids only", () => {
@@ -140,4 +153,74 @@ test("CLI gate: a real gate + real artifact is the only path to done (exit 0)", 
   const r = runGuard("publish", "--gate-status", "done", "--artifact", JSON.stringify(REAL_ARTIFACT));
   assert.equal(r.status, 0);
   assert.match(r.stdout, /"status": "done"/);
+});
+
+// --- THEAAAAA-434: Reel (video_reels) publish proof + caption word cap ---
+
+test("reel: isRealReelVideoId accepts bare numeric video ids only", () => {
+  assert.equal(isRealReelVideoId("9988776655"), true);
+  assert.equal(isRealReelVideoId("1097_99"), false, "page_post form is not a reel video id");
+  assert.equal(isRealReelVideoId(""), false);
+  assert.equal(isRealReelVideoId("pending"), false);
+  assert.equal(isRealReelVideoId(null), false);
+});
+
+test("reel: a real reel artifact carries media_type + video_id + post_id + permalink", () => {
+  const proof = verifyPublishArtifact(REAL_REEL_ARTIFACT);
+  assert.equal(proof.ok, true);
+  assert.equal(proof.media_type, "reel");
+  assert.equal(proof.video_id, "9988776655");
+  assert.equal(proof.facebook_post_id, REAL_REEL_ARTIFACT.facebook_post_id);
+});
+
+test("reel: missing video_id fails closed even with a valid post_id + permalink", () => {
+  const proof = verifyPublishArtifact({ ...REAL_REEL_ARTIFACT, video_id: "not-numeric" });
+  assert.equal(proof.ok, false);
+  assert.match(proof.reasons.join(";"), /video_id/);
+});
+
+test("reel: a bare video_id (no media_type, no post id) is auto-detected as a reel", () => {
+  const proof = verifyPublishArtifact({ video_id: "9988776655", permalink: REAL_REEL_ARTIFACT.permalink });
+  assert.equal(proof.media_type, "reel");
+  // still fails closed: a reel must also carry the {pageId}_{postId} feed id
+  assert.equal(proof.ok, false);
+  assert.match(proof.reasons.join(";"), /facebook_post_id/);
+});
+
+test("reel: legacy photo artifact still validates as media_type photo (backward compatible)", () => {
+  const proof = verifyPublishArtifact(REAL_ARTIFACT);
+  assert.equal(proof.ok, true);
+  assert.equal(proof.media_type, "photo");
+  assert.equal(proof.video_id, null);
+});
+
+test("reel: publish disposition is done with reel proof and surfaces video_id", () => {
+  const d = resolvePublishStepDisposition({ upstreamGate: { status: "done" }, artifact: REAL_REEL_ARTIFACT });
+  assert.equal(d.status, STEP_DONE);
+  assert.equal(d.artifact.media_type, "reel");
+  assert.equal(d.artifact.video_id, "9988776655");
+});
+
+test("reel: dedup-log proceeds when the reel publish carried proof", () => {
+  const publishStep = resolvePublishStepDisposition({ upstreamGate: { status: "done" }, artifact: REAL_REEL_ARTIFACT });
+  const d = resolveDedupLogStepDisposition({ publishStep });
+  assert.equal(d.status, STEP_DONE);
+});
+
+test("reel CLI gate: a real gate + real reel artifact exits 0 as media_type reel", () => {
+  const r = runGuard("publish", "--gate-status", "done", "--artifact", JSON.stringify(REAL_REEL_ARTIFACT));
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /"media_type": "reel"/);
+});
+
+test("caption word cap: empty fails, within-cap passes, over-cap fails closed", () => {
+  assert.equal(CAPTION_WORD_CAP, 205);
+  assert.equal(withinWordCap(""), false);
+  assert.equal(withinWordCap("   "), false);
+  assert.equal(withinWordCap("a few short words"), true);
+  assert.equal(wordCount("one two three"), 3);
+  const over = Array.from({ length: 206 }, (_, i) => `w${i}`).join(" ");
+  assert.equal(withinWordCap(over), false);
+  const atCap = Array.from({ length: 205 }, (_, i) => `w${i}`).join(" ");
+  assert.equal(withinWordCap(atCap), true);
 });

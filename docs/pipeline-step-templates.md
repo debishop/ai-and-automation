@@ -1,9 +1,16 @@
-# Guarded publish-chain step templates (THEAAAAA-381)
+# Guarded publish-chain step templates (THEAAAAA-381, THEAAAAA-434)
 
-Canonical Step 9 (publish) and Step 10 (dedup-log) **issue-body templates** for the daily
-10-step "Viral AI and Automation News Story" chain. These bake the [THEAAAAA-380] fail-closed
-guard into the step *definition* the generator emits, so a false `done` is impossible **by
-template**, not by an agent remembering to run a check.
+Canonical Step 8.7 (reel media-build), Step 9 (publish) and Step 10 (dedup-log) **issue-body
+templates** for the daily 10-step "Viral AI and Automation News Story" chain. These bake the
+[THEAAAAA-380] fail-closed guard into the step *definition* the generator emits, so a false `done`
+is impossible **by template**, not by an agent remembering to run a check.
+
+**THEAAAAA-434 update:** the publish step now emits a **Facebook Reel video** (`video_reels`),
+not a static photo. Step 8.7 builds the stitched 9:16 reel (`scripts/build_reel.sh`,
+[THEAAAAA-433](/THEAAAAA/issues/THEAAAAA-433)); Step 9 publishes it via the 3-phase `video_reels`
+API ([THEAAAAA-322](/THEAAAAA/issues/THEAAAAA-322)) and the guard verifies a reel `video_id` +
+`facebook_post_id` + permalink. The CCO owns the chain emission, so this file is the proposed
+drop-in for CCO adoption (mirrors the [THEAAAAA-423](/THEAAAAA/issues/THEAAAAA-423)→425 pattern).
 
 ## Who generates the chain
 
@@ -31,13 +38,36 @@ Both rules below mirror `evaluateGate()` / `resolvePublishStepDisposition()` /
 
 ---
 
-## Step 9 of 10 — Publish approved post + image to Facebook Page (Engineer)
+## Step 8.7 of 10 — Build the stitched 9:16 reel mp4 (Engineer)
 
-> Run {PARENT_IDENTIFIER}. **Step 9 of 10** (Engineer). Publish the CCO-approved post (Step 8.5)
-> with the real image (Step 8) to the Lens Facebook Page **1097492980106238**. Mint a Page access
-> token at runtime from `FACEBOOK_SYSTEM_USER_TOKEN` (raw system-user token hits #200
-> publish_actions — see Facebook publish pattern). Use the Graph API photo/feed publish. Comment
-> the resulting `post_id` + public permalink; this unblocks Step 10 logging.
+> Run {PARENT_IDENTIFIER}. **Step 8.7 of 10** (Engineer). The chain now publishes a **Reel video**,
+> not a static photo. Build the reel from the CCO-approved post text (Step 8.5) + the real image
+> (Step 8) using the Producer's reel-build script ([THEAAAAA-433](/THEAAAAA/issues/THEAAAAA-433),
+> vendored at `scripts/build_reel.sh`):
+>
+> ```bash
+> scripts/build_reel.sh "<headline>" "<approved post body (Step 8.5)>" \
+>   "<static image url/path (Step 8)>" "$WORKDIR/final_reel.mp4"
+> ```
+>
+> Env: `GOLPOAI_API_KEY` (Doppler). Output: a 1080×1920 9:16 reel mp4 (3s static intro + Golpo
+> animation, uniform libx264/aac/30fps). Re-host the mp4 as a durable Paperclip attachment and
+> comment the watchable link. This feeds Step 9.
+>
+> **FAIL-CLOSED:** if `build_reel.sh` exits non-zero, the Golpo render times out, or `ffprobe`
+> shows the output is not portrait 9:16, set this step **`blocked`** — never hand a bad/absent mp4
+> to Step 9.
+
+## Step 9 of 10 — Publish the stitched reel to the Facebook Page (Engineer)
+
+> Run {PARENT_IDENTIFIER}. **Step 9 of 10** (Engineer). Publish the **reel mp4** from Step 8.7 to
+> the Lens Facebook Page **1097492980106238** as a **Facebook Reel** using the `video_reels`
+> 3-phase API (start → upload bytes → finish with `video_state=PUBLISHED`), caption = the
+> CCO-approved post text (Step 8.5). Mint a Page access token at runtime from
+> `FACEBOOK_SYSTEM_USER_TOKEN` (raw system-user token hits #200 publish_actions — see Facebook
+> publish pattern). Recipe: [THEAAAAA-322](/THEAAAAA/issues/THEAAAAA-322). Helper:
+> `scripts/publish-reel.mjs`. Comment the resulting **reel `video_id` + `post_id` + public
+> watchable permalink**; this unblocks Step 10 logging.
 >
 > **MANDATORY FAIL-CLOSED GATE (pre-`done`, not optional).**
 >
@@ -51,19 +81,23 @@ Both rules below mirror `evaluateGate()` / `resolvePublishStepDisposition()` /
 >    Only `done` / `approved` / `completed` / `accepted` authorizes publishing. `cancelled` /
 >    `blocked` / `failed` / `rejected` / `declined` / missing / any unknown state is a **stop**.
 >
-> 2. **Publish, then prove it.** After the Graph API call, capture the real `facebook_post_id`
->    (`{pageId}_{postId}` or bare numeric) and the https facebook permalink into an artifact JSON.
+> 2. **205-word caption cap + portrait check, then publish.** The approved caption must pass the
+>    205-word cap and the reel mp4 must be portrait 9:16 (both enforced by `publish-reel.mjs`).
+>    Run the `video_reels` 3-phase publish, then capture the real reel `video_id` (bare numeric),
+>    the `facebook_post_id` (`{pageId}_{postId}`), and the https facebook permalink into an
+>    artifact JSON with `"media_type":"reel"`.
 >
 > 3. **Run the guard. Exit 0 is the only thing that authorizes `done`:**
 >    ```bash
 >    node scripts/pipeline-guard-check.mjs publish \
 >      --gate-status "$GATE" \
->      --artifact '{"facebook_post_id":"<id>","permalink":"<https fb url>"}'
+>      --artifact '{"media_type":"reel","video_id":"<reel id>","facebook_post_id":"<{pageId}_{postId}>","permalink":"<https fb reel url>"}'
 >    ```
->    - Exit `0` → you may set this step `done` and comment the `post_id` + permalink.
+>    - Exit `0` → you may set this step `done` and comment the `video_id` + `post_id` + permalink.
 >    - Non-zero → set this step **`blocked`** with the printed reason. **Never `done`.** Do not
->      comment, log, or fabricate a `post_id`. If the gate was not authorized, nothing was
->      published — say so and stop the chain here.
+>      comment, log, or fabricate ids. If the gate was not authorized, nothing was published — say
+>      so and stop the chain here.
+>    - **Verify the live id** via `GET /{page-id}/video_reels` (publish-comment ids can be stale).
 
 ## Step 10 of 10 — Log publication record to dedup DB (Engineer)
 
@@ -74,7 +108,8 @@ Both rules below mirror `evaluateGate()` / `resolvePublishStepDisposition()` /
 > article_url, headline, score (INT; keep decimal in payload.score_detail), used_fallback,
 > claim_status='published', claim_run_id = parent run issue UUID {PARENT_ISSUE_ID}, published_at,
 > facebook_post_id, payload JSONB (title/source/summary/post_content/media_source/
-> hashtags_used[]/facebook_post_link + provenance step map). Report INSERTED_ROWS and new total.
+> `media_type:"reel"`/reel_video_id/hashtags_used[]/facebook_post_link + provenance step map).
+> Report INSERTED_ROWS and new total.
 > This is the terminal step — completes the chain.
 >
 > **MANDATORY FAIL-CLOSED GATE (pre-anything, not optional).** Before opening the DB connection,
@@ -106,6 +141,26 @@ node scripts/pipeline-guard-check.mjs dedup-log --artifact '{}'; echo $?        
 ```
 
 `tests/pipeline-guard.test.js` asserts both exit codes (CLI-level) plus the library semantics.
+
+## Acceptance check — reel publish (THEAAAAA-434)
+
+A real gate + a real reel artifact (media_type/video_id/post_id/permalink) is the only path to
+`done`; a reel missing the `video_id` fails closed:
+
+```bash
+node scripts/pipeline-guard-check.mjs publish --gate-status done \
+  --artifact '{"media_type":"reel","video_id":"123","facebook_post_id":"1097492980106238_1","permalink":"https://www.facebook.com/reel/123"}'; echo $?  # -> 0
+node scripts/pipeline-guard-check.mjs publish --gate-status done \
+  --artifact '{"media_type":"reel","facebook_post_id":"1097492980106238_1","permalink":"https://www.facebook.com/reel/123"}'; echo $?                    # -> 1 (no video_id)
+```
+
+Offline/dry validation of the full media build (no live publish — board-gated per
+[THEAAAAA-431](/THEAAAAA/issues/THEAAAAA-431)):
+
+```bash
+# Probe the stitched mp4 is portrait 9:16 + caption within the 205-word cap; fires NO Graph call.
+node scripts/publish-reel.mjs --reel /path/to/final_reel.mp4 --caption "<approved post>" --dry-run; echo $?  # -> 0
+```
 
 [THEAAAAA-380]: ../README.md
 [THEAAAAA-195]: ./pipeline-fail-closed.md

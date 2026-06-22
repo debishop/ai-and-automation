@@ -14,6 +14,22 @@
 export const STEP_DONE = "done";
 export const STEP_BLOCKED = "blocked";
 
+// Approved-post caption hard cap (THEAAAAA-434 keeps the 205-word gate from the photo step).
+export const CAPTION_WORD_CAP = 205;
+
+export function wordCount(text) {
+  if (typeof text !== "string") return 0;
+  const trimmed = text.trim();
+  if (trimmed === "") return 0;
+  return trimmed.split(/\s+/).length;
+}
+
+// True only when the caption is non-empty and within the word cap. Empty/oversized => fail closed.
+export function withinWordCap(text, cap = CAPTION_WORD_CAP) {
+  const count = wordCount(text);
+  return count > 0 && count <= cap;
+}
+
 // Upstream states that authorize a downstream step to proceed.
 export const GATE_PASS_STATES = new Set(["done", "approved", "completed", "accepted"]);
 // Terminal-stop upstream states that must propagate fail-closed (never auto-advance downstream).
@@ -28,9 +44,17 @@ export const GATE_STOP_STATES = new Set([
 
 // Facebook feed/photo post ids are "{pageId}_{postId}" or a bare numeric id.
 const FACEBOOK_POST_ID = /^\d+(_\d+)?$/;
+// Reel (video_reels) ids returned by the 3-phase publish are bare numeric video ids.
+const FACEBOOK_VIDEO_ID = /^\d+$/;
 
 export function isRealFacebookPostId(value) {
   return typeof value === "string" && FACEBOOK_POST_ID.test(value.trim());
+}
+
+// THEAAAAA-434: the publish step now emits a Facebook Reel (video_reels) instead of a photo.
+// A reel proof carries a bare-numeric `video_id` (the reel id) in addition to the post_id.
+export function isRealReelVideoId(value) {
+  return typeof value === "string" && FACEBOOK_VIDEO_ID.test(value.trim());
 }
 
 export function isRealPermalink(value) {
@@ -67,20 +91,49 @@ export function evaluateGate(upstreamGate) {
   };
 }
 
-// 2. Publish proof-of-work. An artifact only counts if it carries a real post id + permalink.
+// 2. Publish proof-of-work. An artifact only counts if it carries a real publish id + permalink.
+//
+// THEAAAAA-434: the chain now publishes a Reel (video_reels), not a photo. A reel artifact is
+// `{"media_type":"reel","video_id":"<bare numeric reel id>","facebook_post_id":"<page_post>",
+//   "permalink":"<https fb url>"}`. The discriminator is `media_type:"reel"` (or a bare `video_id`
+// with no post id). Photo artifacts (no media_type / no video_id) keep the original contract so
+// the guard stays backward-compatible with the pre-434 step bodies and tests.
 export function verifyPublishArtifact(artifact) {
   if (!artifact || typeof artifact !== "object") {
-    return { ok: false, reasons: ["no publish artifact captured"], facebook_post_id: null, permalink: null };
+    return {
+      ok: false,
+      reasons: ["no publish artifact captured"],
+      media_type: null,
+      facebook_post_id: null,
+      video_id: null,
+      permalink: null,
+    };
   }
+  const mediaType =
+    typeof artifact.media_type === "string" ? artifact.media_type.toLowerCase().trim() : null;
   const postId = artifact.facebook_post_id ?? artifact.post_id ?? null;
+  const videoId = artifact.video_id ?? artifact.reel_id ?? null;
   const permalink = artifact.permalink ?? artifact.permalink_url ?? artifact.url ?? null;
+  // Treat as a reel when explicitly tagged, or when a video id is present without a post id.
+  const isReel = mediaType === "reel" || (videoId != null && postId == null);
   const reasons = [];
+
+  let resolvedVideoId = null;
+  if (isReel) {
+    if (!isRealReelVideoId(videoId)) reasons.push("missing or malformed video_id (reel)");
+    else resolvedVideoId = String(videoId).trim();
+  }
+  // A real Facebook post id is still required for both photo and reel (the reel finish phase
+  // returns a `{pageId}_{postId}` feed id alongside the video id; Step 10 logs it as before).
   if (!isRealFacebookPostId(postId)) reasons.push("missing or malformed facebook_post_id");
   if (!isRealPermalink(permalink)) reasons.push("missing or malformed permalink");
+
   return {
     ok: reasons.length === 0,
     reasons,
+    media_type: isReel ? "reel" : "photo",
     facebook_post_id: isRealFacebookPostId(postId) ? String(postId).trim() : null,
+    video_id: resolvedVideoId,
     permalink: isRealPermalink(permalink) ? String(permalink).trim() : null,
   };
 }
@@ -113,10 +166,19 @@ export function resolvePublishStepDisposition({ upstreamGate, artifact } = {}) {
       artifact: null,
     };
   }
+  const provenArtifact = {
+    media_type: proof.media_type,
+    facebook_post_id: proof.facebook_post_id,
+    permalink: proof.permalink,
+  };
+  if (proof.media_type === "reel") provenArtifact.video_id = proof.video_id;
   return {
     status: STEP_DONE,
-    reason: "publish proof captured (facebook_post_id + permalink)",
-    artifact: { facebook_post_id: proof.facebook_post_id, permalink: proof.permalink },
+    reason:
+      proof.media_type === "reel"
+        ? "publish proof captured (reel video_id + facebook_post_id + permalink)"
+        : "publish proof captured (facebook_post_id + permalink)",
+    artifact: provenArtifact,
   };
 }
 
