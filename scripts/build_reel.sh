@@ -4,6 +4,8 @@
 # Env: GOLPOAI_API_KEY, GOLPOAI_API_BASE_URL (default https://api.golpoai.com)
 # Output: final 9:16 reel mp4 at <output_path>
 # Requires: ffmpeg, curl, jq
+# Defaults: loaded from golpoai-defaults.json (mirror of golpoai-runbook skill §7)
+# Governance: https://paperclip-vicf.srv1571762.hstgr.cloud (skill e95e1ff3-4515-4429-a94a-2bc2715e2fc1)
 
 set -euo pipefail
 
@@ -18,6 +20,15 @@ trap 'rm -rf "$WORKDIR"' EXIT
 
 echo "[build_reel] Workdir: $WORKDIR"
 
+# --- Load §7 defaults from golpoai-defaults.json ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULTS_FILE="$SCRIPT_DIR/golpoai-defaults.json"
+if [ ! -f "$DEFAULTS_FILE" ]; then
+  echo "[build_reel] ERROR: $DEFAULTS_FILE not found. Cannot proceed without §7 defaults." >&2
+  exit 1
+fi
+echo "[build_reel] Loaded defaults from $DEFAULTS_FILE"
+
 # --- Step 1: Submit Golpo render ---
 PROMPT="$HEADLINE
 
@@ -29,20 +40,8 @@ SUBMIT_RESP=$(curl -sf -X POST "$API_BASE/api/v2/videos/generate" \
   -H "Content-Type: application/json" \
   -d "$(jq -n \
     --arg prompt "$PROMPT" \
-    '{
-      prompt: $prompt,
-      video_style: "golpo_sketch",
-      golpo_type: "golpo_sketch",
-      video_generation_model: "golpo_sketch",
-      video_duration: "0.5",
-      pacing: "fast",
-      video_voice: "solo-male-4",
-      image_style: "technical",
-      language: "en",
-      display_language: "en",
-      include_watermark: false,
-      video_type: "long"
-    }')")
+    --slurpfile d "$DEFAULTS_FILE" \
+    '$d[0] | del(._source, ._note) | .prompt = $prompt')")
 
 JOB_ID=$(echo "$SUBMIT_RESP" | jq -r '.job_id')
 echo "[build_reel] Golpo job_id: $JOB_ID"
@@ -114,9 +113,7 @@ ffmpeg -y -i "$GOLPO_MP4" \
 
 # --- Step 7: Concat intro + animation ---
 CONCAT_LIST="$WORKDIR/concat.txt"
-printf "file '%s'
-file '%s'
-" "$INTRO_MP4" "$GOLPO_9X16" > "$CONCAT_LIST"
+printf "file '%s'\nfile '%s'\n" "$INTRO_MP4" "$GOLPO_9X16" > "$CONCAT_LIST"
 
 echo "[build_reel] Concatenating intro + animation..."
 ffmpeg -y -f concat -safe 0 -i "$CONCAT_LIST" \
