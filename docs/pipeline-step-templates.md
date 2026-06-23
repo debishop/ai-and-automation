@@ -10,7 +10,10 @@ not a static photo. Step 8.7 builds the stitched 9:16 reel (`scripts/build_reel.
 [THEAAAAA-433](/THEAAAAA/issues/THEAAAAA-433)); Step 9 publishes it via the 3-phase `video_reels`
 API ([THEAAAAA-322](/THEAAAAA/issues/THEAAAAA-322)) and the guard verifies a reel `video_id` +
 `facebook_post_id` + permalink. The CCO owns the chain emission, so this file is the proposed
-drop-in for CCO adoption (mirrors the [THEAAAAA-423](/THEAAAAA/issues/THEAAAAA-423)→425 pattern).
+drop-in for CCO adoption (mirrors the [THEAAAAA-423](/THEAAAAA/issues/THEAAAAA-423)→425 adoption
+pattern; GolpoAI render parameters are governed by the
+[golpoai-runbook skill](/THEAAAAA/skills/e95e1ff3-4515-4429-a94a-2bc2715e2fc1) §7 — the deprecated
+423 runbook redirects there).
 
 ## Who generates the chain
 
@@ -53,6 +56,11 @@ Both rules below mirror `evaluateGate()` / `resolvePublishStepDisposition()` /
 > Env: `GOLPOAI_API_KEY` (Doppler). Output: a 1080×1920 9:16 reel mp4 (3s static intro + Golpo
 > animation, uniform libx264/aac/30fps). Re-host the mp4 as a durable Paperclip attachment and
 > comment the watchable link. This feeds Step 9.
+>
+> *Render parameters (animation type, video_duration, watermark, resolution) are **not** restated
+> here — `build_reel.sh` reads them from `golpoai-defaults.json`; the single source of truth is the
+> [golpoai-runbook skill](/THEAAAAA/skills/e95e1ff3-4515-4429-a94a-2bc2715e2fc1) §7. Do not restate
+> values.*
 >
 > **FAIL-CLOSED:** if `build_reel.sh` exits non-zero, the Golpo render times out, or `ffprobe`
 > shows the output is not portrait 9:16, set this step **`blocked`** — never hand a bad/absent mp4
