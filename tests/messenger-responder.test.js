@@ -20,10 +20,10 @@ function msg(fromId, name, createdMsAgo, now, text = "hi") {
 
 // --- Verbatim copy is locked ---
 
-test("WELCOME_REPLY is the exact CTO-approved funnel copy", () => {
+test("WELCOME_REPLY is the exact CCO-approved funnel copy", () => {
   assert.equal(
     WELCOME_REPLY,
-    "Thanks for reaching out to The Lens. Reply YES and we will add you to the weekly AI in Africa brief, delivered every week, straight here.",
+    "**Welcome to The Lens.** You're in for a weekly global brief on AI and automation: policy moves, honest tool reviews, and company news with real tension, drawn from the Americas, Europe, Asia-Pacific, Africa, and the Middle East. One short read, one question to answer. Reply `start` to opt in.",
   );
 });
 

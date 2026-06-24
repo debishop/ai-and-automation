@@ -6,11 +6,12 @@ const DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000; // Messenger standard RESPONSE wi
 
 /**
  * Verbatim newsletter-conversion welcome reply for "The Lens" page.
- * Authored by the CTO on THEAAAAA-238 — DO NOT edit the wording. Any change to
- * the funnel copy must come back through the issue, not a code tweak.
+ * CCO-approved on THEAAAAA-558 (globally-framed v1.1, supersedes the prior
+ * Nigeria/Africa-framed copy). DO NOT edit the wording — any change must come
+ * back through the issue, not a code tweak.
  */
 export const WELCOME_REPLY =
-  "Thanks for reaching out to The Lens. Reply YES and we will add you to the weekly AI in Africa brief, delivered every week, straight here.";
+  "**Welcome to The Lens.** You're in for a weekly global brief on AI and automation: policy moves, honest tool reviews, and company news with real tension, drawn from the Americas, Europe, Asia-Pacific, Africa, and the Middle East. One short read, one question to answer. Reply `start` to opt in.";
 
 function quoteTableName(name) {
   if (!VALID_TABLE_NAME.test(name)) {
