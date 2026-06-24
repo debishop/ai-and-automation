@@ -30,8 +30,10 @@ export const INTERVALS = [
 ];
 export const WINDOW_SEC = 30 * 60; // ±30 min match window per spec.
 
+// `post_impressions_unique` (and `post_impressions`) return Graph #100
+// "not a valid insights metric" on The Lens Page in v19.0 — reach is sourced
+// implicitly via reactions/clicks instead and left null when unavailable.
 export const POST_INSIGHT_METRICS = [
-  "post_impressions_unique",
   "post_reactions_by_type_total",
   "post_clicks",
 ];
