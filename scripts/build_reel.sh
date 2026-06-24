@@ -94,12 +94,19 @@ if echo "$STATIC_IMAGE" | grep -qE '^https?://'; then
 fi
 
 # --- Step 5: Build 3s intro from static image (1080x1920, black canvas) ---
+# Intro MUST carry a silent AAC stream matching the Golpo segment's audio
+# layout/sample rate. Otherwise the Step 7 concat demuxer sees mismatched
+# streams across inputs and silently drops the Golpo narration (THEAAAAA-566:
+# Run 527 reel shipped without voice).
 INTRO_MP4="$WORKDIR/intro.mp4"
-echo "[build_reel] Building 3s intro from static image..."
-ffmpeg -y -loop 1 -i "$STATIC_IMAGE" -t 3 \
+echo "[build_reel] Building 3s intro from static image (with silent AAC track)..."
+ffmpeg -y -loop 1 -i "$STATIC_IMAGE" \
+  -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+  -t 3 \
   -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1" \
   -c:v libx264 -pix_fmt yuv420p -r 30 \
-  -an \
+  -c:a aac -ar 44100 -ac 2 \
+  -shortest \
   "$INTRO_MP4"
 
 # --- Step 6: Reframe Golpo 16:9 → 9:16 (black canvas, no crop) ---
@@ -108,7 +115,7 @@ echo "[build_reel] Reframing Golpo 1536x864 → 1080x1920 (black canvas)..."
 ffmpeg -y -i "$GOLPO_MP4" \
   -vf "scale=1080:608:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30" \
   -c:v libx264 -pix_fmt yuv420p -r 30 \
-  -c:a aac -ar 44100 \
+  -c:a aac -ar 44100 -ac 2 \
   "$GOLPO_9X16"
 
 # --- Step 7: Concat intro + animation ---
