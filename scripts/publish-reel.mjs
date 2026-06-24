@@ -17,8 +17,14 @@
 // The board has gated the live run (THEAAAAA-431): this is the only mode this work is allowed to
 // exercise until a test run is explicitly authorized.
 import { spawnSync } from "node:child_process";
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { withinWordCap, wordCount, CAPTION_WORD_CAP } from "../src/pipeline-guard.js";
+import {
+  GUARD_WINDOW_MINUTES,
+  checkRecentHash,
+  computeContentHash,
+  recordContentHash,
+} from "../src/content-hash.js";
 
 const GRAPH_VERSION = "v22.0";
 const DEFAULT_PAGE_ID = "1097492980106238"; // The Lens — AI and Automation
@@ -94,7 +100,6 @@ async function mintPageToken(pageId, systemUserToken, fetchImpl = fetch) {
 // Live 3-phase video_reels publish. Intentionally not exercised under the board gate; kept here so
 // the chain is ready-to-run the moment a test run is authorized.
 async function publishReelLive({ reelPath, caption, pageId, token, fetchImpl = fetch }) {
-  const { readFileSync } = await import("node:fs");
   // Phase 1 — start: reserve a video container + upload endpoint.
   const startRes = await fetchImpl(
     `https://graph.facebook.com/${GRAPH_VERSION}/${pageId}/video_reels`,
@@ -153,15 +158,38 @@ async function publishReelLive({ reelPath, caption, pageId, token, fetchImpl = f
   };
 }
 
+// Opens a pg Client against DATABASE_URL with the same timeout posture as the
+// Step 10 dedup-log script. Returns null when DATABASE_URL is unset AND the caller
+// allowed skipping (dry-run smokes can opt out via --skip-guard). A live publish
+// without DATABASE_URL must fail closed.
+async function openGuardClient({ required }) {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    if (required) throw new Error("DATABASE_URL required for content-hash guard");
+    return null;
+  }
+  const { Client } = await import("pg");
+  const c = new Client({
+    connectionString: url,
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 10_000,
+    statement_timeout: 10_000,
+    query_timeout: 10_000,
+  });
+  await c.connect();
+  return c;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const reelPath = args.reel;
   const caption = typeof args.caption === "string" ? args.caption : "";
   const pageId = args["page-id"] || process.env.FACEBOOK_PAGE_ID || DEFAULT_PAGE_ID;
   const dryRun = Boolean(args["dry-run"]);
+  const skipGuard = Boolean(args["skip-guard"]);
 
   if (!reelPath) {
-    console.error("usage: node scripts/publish-reel.mjs --reel <mp4> --caption <text> [--dry-run]");
+    console.error("usage: node scripts/publish-reel.mjs --reel <mp4> --caption <text> [--dry-run] [--skip-guard]");
     process.exit(2);
   }
 
@@ -171,8 +199,61 @@ async function main() {
     process.exit(1);
   }
 
+  // Content-hash idempotency guard (THEAAAAA-586). Computed BEFORE the start phase so a
+  // duplicate publish never reserves a video container in Graph. Hash inputs:
+  // normalized caption + raw mp4 bytes + page id. Fail-closed exit code 9.
+  const mediaBytes = readFileSync(reelPath);
+  const contentHash = computeContentHash({ caption, mediaBytes, pageId });
+  let guardClient = null;
+  let priorGuardHit = null;
+  if (!skipGuard) {
+    guardClient = await openGuardClient({ required: !dryRun });
+    if (guardClient) {
+      priorGuardHit = await checkRecentHash(guardClient, {
+        contentHash,
+        pageId,
+        isDryRun: dryRun,
+        windowMinutes: GUARD_WINDOW_MINUTES,
+      });
+      if (priorGuardHit) {
+        console.error(
+          JSON.stringify(
+            {
+              ok: false,
+              stage: "content-hash-guard",
+              reason: "duplicate publish attempt within window",
+              windowMinutes: GUARD_WINDOW_MINUTES,
+              pageId,
+              contentHash,
+              priorGuardHit,
+              note:
+                "fail-closed: a publish with this exact (caption, media, page) shipped less than " +
+                `${GUARD_WINDOW_MINUTES} minutes ago. Investigate before retrying.`,
+            },
+            null,
+            2,
+          ),
+        );
+        await guardClient.end();
+        process.exit(9);
+      }
+    }
+  }
+
   if (dryRun) {
     // Offline proof: inputs are publish-ready; emit the artifact shape, fire nothing.
+    // Record the guard hit so a repeated dry-run within the window is rejected above.
+    let dryGuardRecord = null;
+    if (guardClient) {
+      dryGuardRecord = await recordContentHash(guardClient, {
+        contentHash,
+        pageId,
+        postId: null,
+        isDryRun: true,
+        note: "publish-reel.mjs --dry-run",
+      });
+      await guardClient.end();
+    }
     console.log(
       JSON.stringify(
         {
@@ -182,6 +263,10 @@ async function main() {
           pageId,
           probe: validation.probe,
           captionWords: wordCount(caption),
+          contentHash,
+          guard: guardClient
+            ? { recorded: true, windowMinutes: GUARD_WINDOW_MINUTES, record: dryGuardRecord }
+            : { recorded: false, reason: "DATABASE_URL not set (--skip-guard or unset)" },
           plannedArtifact: {
             media_type: "reel",
             video_id: "<bare-numeric reel id from finish phase>",
@@ -199,12 +284,26 @@ async function main() {
 
   const systemUserToken = process.env.FACEBOOK_SYSTEM_USER_TOKEN;
   if (!systemUserToken) {
+    if (guardClient) await guardClient.end();
     console.error("FACEBOOK_SYSTEM_USER_TOKEN required for a live publish");
     process.exit(2);
   }
-  const token = await mintPageToken(pageId, systemUserToken);
-  const artifact = await publishReelLive({ reelPath, caption, pageId, token });
-  console.log(JSON.stringify({ ok: true, dryRun: false, artifact }, null, 2));
+  try {
+    const token = await mintPageToken(pageId, systemUserToken);
+    const artifact = await publishReelLive({ reelPath, caption, pageId, token });
+    if (guardClient) {
+      await recordContentHash(guardClient, {
+        contentHash,
+        pageId,
+        postId: artifact.facebook_post_id,
+        isDryRun: false,
+        note: `video_id=${artifact.video_id}`,
+      });
+    }
+    console.log(JSON.stringify({ ok: true, dryRun: false, contentHash, artifact }, null, 2));
+  } finally {
+    if (guardClient) await guardClient.end();
+  }
 }
 
 // Only run main when invoked as a script (allows importing the pure validators in tests).
