@@ -1,0 +1,15 @@
+{
+  "_source": "golpoai-runbook skill §7 (e95e1ff3-4515-4429-a94a-2bc2715e2fc1) — board-approved THEAAAAA-426",
+  "_note": "This is the single machine-readable mirror of §7 defaults. Edit the skill, then regenerate this file. Do not edit values here directly.",
+  "video_style": "golpo_sketch",
+  "golpo_type": "golpo_sketch",
+  "video_generation_model": "golpo_sketch",
+  "image_style": "technical",
+  "video_voice": "solo-male-4",
+  "video_duration": "0.5",
+  "pacing": "fast",
+  "language": "en",
+  "display_language": "en",
+  "include_watermark": false,
+  "video_type": "long"
+}

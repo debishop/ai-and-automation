@@ -6,9 +6,14 @@
 //
 // Usage:
 //   # Step 9 (publish): pass the upstream gate status + the captured publish artifact.
+//   # Photo (legacy):
 //   node scripts/pipeline-guard-check.mjs publish \
 //     --gate-status done \
 //     --artifact '{"facebook_post_id":"1097492980106238_123","permalink":"https://www.facebook.com/.../posts/123"}'
+//   # Reel (video_reels, THEAAAAA-434): also carries media_type + video_id (the reel id).
+//   node scripts/pipeline-guard-check.mjs publish \
+//     --gate-status done \
+//     --artifact '{"media_type":"reel","video_id":"123","facebook_post_id":"1097492980106238_123","permalink":"https://www.facebook.com/reel/123"}'
 //
 //   # Step 10 (dedup-log): pass the Step 9 artifact (or omit to assert absence).
 //   node scripts/pipeline-guard-check.mjs dedup-log \
