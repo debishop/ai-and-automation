@@ -62,9 +62,16 @@ Both rules below mirror `evaluateGate()` / `resolvePublishStepDisposition()` /
 > [golpoai-runbook skill](/THEAAAAA/skills/e95e1ff3-4515-4429-a94a-2bc2715e2fc1) §7. Do not restate
 > values.*
 >
-> **FAIL-CLOSED:** if `build_reel.sh` exits non-zero, the Golpo render times out, or `ffprobe`
-> shows the output is not portrait 9:16, set this step **`blocked`** — never hand a bad/absent mp4
-> to Step 9.
+> **FAIL-CLOSED:** if `build_reel.sh` exits non-zero, the Golpo render times out, or the media
+> gate (`scripts/media-gate.mjs`) exits non-zero, set this step **`blocked`** — never hand a
+> bad/absent mp4 to Step 9. The media gate verifies portrait 1080×1920 h264 + AAC audio stream
+> + duration > 0 **and** voice presence (non-silent audio ≥ `VOICE_MIN_NONSILENT_FRACTION`,
+> default 30%) via `ffmpeg silencedetect`. Closes the Run 527 regression (THEAAAAA-566/-567)
+> where a silent-track reel slipped through the legacy probe.
+>
+> ```bash
+> node scripts/media-gate.mjs "$WORKDIR/final_reel.mp4"
+> ```
 
 ## Step 9 of 10 — Publish the stitched reel to the Facebook Page (Engineer)
 
