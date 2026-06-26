@@ -10,11 +10,74 @@ import {
   confirmNotPublished,
   publishPhoto,
   publishRun,
+  verifyPostVisible,
+  verifyPostVisibleWithPolling,
   PublishError,
   MAX_RETRIES,
   REQUIRED_WIDTH,
   REQUIRED_HEIGHT,
 } from "../src/vep/publish-post.mjs";
+
+// THEAAAAA-668 / THEAAAAA-669 — Helper: read-back GET handler. Tests opt into a
+// visible/missing post by passing `verifyResponse`. Default = visible with
+// permalink so happy paths don't need to know about the read-back. There are
+// two verify endpoints now:
+//   - /{page_id}/published_posts?... (THEAAAAA-669 feed verify, primary)
+//   - /{post-id}?fields=... (THEAAAAA-668 single-post read-back, corroborating)
+// The helper sniffs the photo create response to learn the post id, then
+// synthesizes matching/missing feed and post-id responses driven by
+// `verifyResponse`.
+function makeFetch({ photo, verifyResponse = "visible", postsFeed } = {}) {
+  let lastPhotoId = null;
+  return async (url, opts) => {
+    if (url.includes("/photos")) {
+      const r = await photo(url, opts);
+      const text = await r.text();
+      try {
+        const parsed = JSON.parse(text);
+        lastPhotoId = parsed.post_id || parsed.id || null;
+      } catch {}
+      return { ok: r.ok, status: r.status, async text() { return text; } };
+    }
+    // THEAAAAA-669 feed verify: /{page_id}/published_posts?...
+    if (url.includes("/published_posts?")) {
+      if (typeof verifyResponse === "function") return verifyResponse(url);
+      if (verifyResponse === "visible") {
+        const id = lastPhotoId || "P_UNKNOWN";
+        return {
+          ok: true,
+          async text() {
+            return JSON.stringify({
+              data: [{ id, permalink_url: `https://fb/${id}`, created_time: "2026-06-26T00:00:00Z" }],
+            });
+          },
+        };
+      }
+      if (verifyResponse === "missing") {
+        return { ok: true, async text() { return JSON.stringify({ data: [] }); } };
+      }
+    }
+    // confirmNotPublished feed: /{page_id}/posts?...
+    if (url.match(/\/posts\?/)) return postsFeed ? postsFeed(url) : { ok: true, async json() { return { data: [] }; } };
+    // THEAAAAA-668 single-post read-back: /{post-id}?fields=...
+    if (url.includes("fields=id,permalink_url,created_time")) {
+      if (typeof verifyResponse === "function") return verifyResponse(url);
+      if (verifyResponse === "visible") {
+        const id = url.match(/v19\.0\/([^?]+)\?/)[1];
+        return {
+          ok: true,
+          async text() {
+            return JSON.stringify({ id, permalink_url: `https://fb/${id}`, created_time: "2026-06-26T00:00:00Z" });
+          },
+        };
+      }
+      if (verifyResponse === "missing") {
+        return { ok: false, status: 400, async text() { return JSON.stringify({ error: { code: 10, message: "Unsupported get request" } }); } };
+      }
+    }
+    throw new Error("unexpected fetch: " + url);
+  };
+}
 
 // ------- token chain -------
 
@@ -284,14 +347,11 @@ function mockPgFor(row, opts = {}) {
   };
 }
 
-test("publishRun: happy path publishes, logs success, sets Published", async () => {
+test("publishRun: happy path publishes, verifies, logs success, sets Published", async () => {
   const pg = mockPgFor(runRow());
-  const fetchImpl = async (url) => {
-    if (url.includes("/photos")) {
-      return { ok: true, status: 200, async text() { return JSON.stringify({ post_id: "P_99" }); } };
-    }
-    throw new Error("unexpected fetch: " + url);
-  };
+  const fetchImpl = makeFetch({
+    photo: () => ({ ok: true, status: 200, async text() { return JSON.stringify({ post_id: "P_99" }); } }),
+  });
   const r = await publishRun({
     runId: "R1",
     pgClient: pg,
@@ -301,6 +361,8 @@ test("publishRun: happy path publishes, logs success, sets Published", async () 
   });
   assert.equal(r.published, true);
   assert.equal(r.fb_post_id, "P_99");
+  assert.equal(r.verify.visible, true);
+  assert.equal(r.permalink, "https://fb/P_99");
   assert.equal(pg.inserts.length, 1);
   assert.equal(pg.inserts[0][1], "success");
   const setPublished = pg.updates.find((u) => u.text.includes("'Published'"));
@@ -334,17 +396,13 @@ test("publishRun: advisory lock busy → skipped", async () => {
 test("publishRun: retries on 5xx, then succeeds; uses 60s/180s backoff", async () => {
   const pg = mockPgFor(runRow());
   let n = 0;
-  const fetchImpl = async (url) => {
-    if (url.includes("/photos")) {
+  const fetchImpl = makeFetch({
+    photo: () => {
       n += 1;
       if (n < 3) return { ok: false, status: 503, async text() { return "down"; } };
       return { ok: true, status: 200, async text() { return JSON.stringify({ id: "P_OK" }); } };
-    }
-    if (url.includes("/posts?")) {
-      return { ok: true, async json() { return { data: [] }; } };
-    }
-    throw new Error("unexpected: " + url);
-  };
+    },
+  });
   const sleeps = [];
   const r = await publishRun({
     runId: "R1", pgClient: pg, env: { FACEBOOK_PAGE_ACCESS_TOKEN: "T" }, fetchImpl,
@@ -352,6 +410,8 @@ test("publishRun: retries on 5xx, then succeeds; uses 60s/180s backoff", async (
   });
   assert.equal(r.published, true);
   assert.equal(r.attempts, 3);
+  // 60s + 180s publish backoff. Read-back of the final success is visible on
+  // the first poll so it adds no sleeps.
   assert.deepEqual(sleeps, [60_000, 180_000]);
 });
 
@@ -446,4 +506,162 @@ test("publishRun: missing run row → non-retryable load error", async () => {
     () => publishRun({ runId: "missing", pgClient: pg, env: { FACEBOOK_PAGE_ACCESS_TOKEN: "T" }, fetchImpl: async () => ({}), sleep: async () => {} }),
     (e) => e instanceof PublishError && e.stage === "load" && e.retryable === false,
   );
+});
+
+// ------- THEAAAAA-668: post-publish Graph read-back -------
+
+test("verifyPostVisible: 2xx with id → visible, captures permalink/created_time", async () => {
+  const fetchImpl = async (url) => {
+    assert.match(url, /\/v19\.0\/P_1\?fields=id,permalink_url,created_time/);
+    return {
+      ok: true,
+      async text() {
+        return JSON.stringify({ id: "P_1", permalink_url: "https://fb/P_1", created_time: "2026-06-26T00:00:00Z" });
+      },
+    };
+  };
+  const r = await verifyPostVisible({ postId: "P_1", token: "T", fetchImpl });
+  assert.equal(r.visible, true);
+  assert.equal(r.permalink_url, "https://fb/P_1");
+  assert.equal(r.created_time, "2026-06-26T00:00:00Z");
+});
+
+test("verifyPostVisible: Graph 400 + error code 10 → not visible (the THEAAAAA-543 case)", async () => {
+  const fetchImpl = async () => ({
+    ok: false,
+    status: 400,
+    async text() { return JSON.stringify({ error: { code: 10, message: "Unsupported get request" } }); },
+  });
+  const r = await verifyPostVisible({ postId: "P_404", token: "T", fetchImpl });
+  assert.equal(r.visible, false);
+  assert.equal(r.status, 400);
+  assert.equal(r.response.error.code, 10);
+});
+
+test("verifyPostVisible: transport error → not visible (no throw)", async () => {
+  const fetchImpl = async () => { throw new Error("ECONNRESET"); };
+  const r = await verifyPostVisible({ postId: "P_1", token: "T", fetchImpl });
+  assert.equal(r.visible, false);
+  assert.match(r.error, /ECONNRESET/);
+});
+
+test("verifyPostVisibleWithPolling: feed misses then becomes visible within window", async () => {
+  let feedN = 0;
+  const fetchImpl = async (url) => {
+    if (url.includes("/published_posts?")) {
+      feedN += 1;
+      if (feedN < 3) return { ok: true, async text() { return JSON.stringify({ data: [] }); } };
+      return {
+        ok: true,
+        async text() {
+          return JSON.stringify({ data: [{ id: "P_1", permalink_url: "https://fb/P_1" }] });
+        },
+      };
+    }
+    // corroborating /{post-id} read-back: visible on first try once feed agrees
+    return { ok: true, async text() { return JSON.stringify({ id: "P_1", permalink_url: "https://fb/P_1" }); } };
+  };
+  let t = 0;
+  const sleeps = [];
+  const r = await verifyPostVisibleWithPolling({
+    postId: "P_1",
+    pageId: "PAGE",
+    sinceEpochSec: 1,
+    token: "T",
+    fetchImpl,
+    windowMs: 60_000,
+    pollMs: 5_000,
+    sleep: async (ms) => { sleeps.push(ms); t += ms; },
+    now: () => t,
+  });
+  assert.equal(r.visible, true);
+  assert.equal(feedN, 3);
+  assert.deepEqual(sleeps, [5_000, 5_000]);
+});
+
+test("verifyPostVisibleWithPolling: never in feed → timedOut after window", async () => {
+  const fetchImpl = async (url) => {
+    if (url.includes("/published_posts?")) {
+      return { ok: true, async text() { return JSON.stringify({ data: [] }); } };
+    }
+    return { ok: false, status: 400, async text() { return JSON.stringify({ error: { code: 10 } }); } };
+  };
+  let t = 0;
+  const r = await verifyPostVisibleWithPolling({
+    postId: "P_1",
+    pageId: "PAGE",
+    sinceEpochSec: 1,
+    token: "T",
+    fetchImpl,
+    windowMs: 60_000,
+    pollMs: 5_000,
+    sleep: async (ms) => { t += ms; },
+    now: () => t,
+  });
+  assert.equal(r.visible, false);
+  assert.equal(r.timedOut, true);
+});
+
+test("publishRun: photo POST succeeds but read-back never finds post → Publishing Failed + alert", async () => {
+  const pg = mockPgFor(runRow());
+  const fetchImpl = makeFetch({
+    photo: () => ({ ok: true, status: 200, async text() { return JSON.stringify({ post_id: "P_GHOST" }); } }),
+    verifyResponse: "missing",
+  });
+  let hookCalls = 0;
+  const r = await publishRun({
+    runId: "R1",
+    pgClient: pg,
+    env: { FACEBOOK_PAGE_ACCESS_TOKEN: "T" },
+    fetchImpl,
+    sleep: async () => {},
+    verifyWindowMs: 100,
+    verifyPollMs: 25,
+    onFinalFailure: async () => { hookCalls += 1; },
+  });
+  assert.equal(r.published, false);
+  assert.equal(r.failed, true);
+  assert.equal(r.unverified, true);
+  assert.equal(r.fb_post_id, "P_GHOST");
+  assert.equal(hookCalls, 1);
+  assert.equal(pg.inserts[0][1], "publish_unverified");
+  const failed = pg.updates.find((u) => u.text.includes("'Publishing Failed'"));
+  assert.ok(failed, "should set Publishing Failed");
+  assert.match(failed.params[1], /not visible on page feed/);
+  // No row should be marked Published when read-back misses.
+  assert.ok(!pg.updates.some((u) => u.text.includes("'Published'")));
+});
+
+test("publishRun: read-back visible after a poll → still publishes (no false negative)", async () => {
+  const pg = mockPgFor(runRow());
+  let feedN = 0;
+  const fetchImpl = makeFetch({
+    photo: () => ({ ok: true, async text() { return JSON.stringify({ post_id: "P_OK" }); } }),
+    verifyResponse: (url) => {
+      if (url.includes("/published_posts?")) {
+        feedN += 1;
+        if (feedN < 2) return { ok: true, async text() { return JSON.stringify({ data: [] }); } };
+        return {
+          ok: true,
+          async text() {
+            return JSON.stringify({ data: [{ id: "P_OK", permalink_url: "https://fb/P_OK" }] });
+          },
+        };
+      }
+      // corroborating post-id read-back is visible once feed agrees
+      return { ok: true, async text() { return JSON.stringify({ id: "P_OK", permalink_url: "https://fb/P_OK" }); } };
+    },
+  });
+  const r = await publishRun({
+    runId: "R1",
+    pgClient: pg,
+    env: { FACEBOOK_PAGE_ACCESS_TOKEN: "T" },
+    fetchImpl,
+    sleep: async () => {},
+    verifyWindowMs: 60_000,
+    verifyPollMs: 1,
+  });
+  assert.equal(r.published, true);
+  assert.equal(r.fb_post_id, "P_OK");
+  assert.equal(feedN, 2);
 });

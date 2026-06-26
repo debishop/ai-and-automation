@@ -23,6 +23,20 @@ export const REQUIRED_WIDTH = 1080;
 export const REQUIRED_HEIGHT = 1350;
 export const HTTP_TIMEOUT_MS = 30_000;
 export const CONFIRMATION_WINDOW_SEC = 300;
+// THEAAAAA-668 / THEAAAAA-669 — post-publish Graph read-back. The /photos
+// create-call returning a post_id is not proof that the post is visible on the
+// page feed; THEAAAAA-543 recorded a post id that 404'd on read-back (Graph
+// error 10) and was missing from the page `published_posts` feed entirely.
+// We confirm visibility two ways and require BOTH:
+//   1. GET /{page_id}/published_posts?since=t-30s&limit=10 must include the id
+//   2. GET /{post-id}?fields=id,... must return 2xx with that id
+// Board spec from THEAAAAA-669: 3 attempts × 5s apart between polls (≈15s).
+export const VERIFY_ATTEMPTS = 3;
+export const VERIFY_POLL_MS = 5_000;
+export const VERIFY_WINDOW_MS = (VERIFY_ATTEMPTS - 1) * VERIFY_POLL_MS;
+// /{page_id}/published_posts `since` is publish_time - 30s, per THEAAAAA-669.
+export const VERIFY_FEED_LOOKBACK_SEC = 30;
+export const VERIFY_FEED_LIMIT = 10;
 
 export class PublishError extends Error {
   constructor(message, { stage, retryable = true, response = null } = {}) {
@@ -193,6 +207,155 @@ export async function confirmNotPublished({
   return { confirmedNotPublished: true, scanned: posts.length };
 }
 
+// THEAAAAA-668 — single read-back via /{post-id}. Returns { visible, ... }.
+// We treat any non-2xx (incl. the 404/code-10 seen on the THEAAAAA-543 post) or
+// a missing id in the response as not-visible. Transport errors are not treated
+// as visible — caller polls.
+export async function verifyPostVisible({ postId, token, fetchImpl = fetch }) {
+  if (!postId) return { visible: false, error: "postId required" };
+  const url =
+    `https://graph.facebook.com/${GRAPH_VERSION}/${postId}` +
+    `?fields=id,permalink_url,created_time&access_token=${token}`;
+  let res;
+  try {
+    res = await fetchWithTimeout(url, {}, HTTP_TIMEOUT_MS, fetchImpl);
+  } catch (err) {
+    return { visible: false, error: `verify fetch: ${err.message}` };
+  }
+  const text = await res.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = { raw: text };
+  }
+  if (!res.ok) {
+    return { visible: false, status: res.status, response: payload };
+  }
+  if (payload && payload.id) {
+    return {
+      visible: true,
+      response: payload,
+      permalink_url: payload.permalink_url || null,
+      created_time: payload.created_time || null,
+    };
+  }
+  return { visible: false, response: payload };
+}
+
+// THEAAAAA-669 — Page-feed read-back. The board's explicit verification path:
+// GET /{page_id}/published_posts?since=<publish_time-30s>&limit=10 and confirm
+// the returned id matches the post we just created. This is the same query used
+// in the THEAAAAA-664 audit that surfaced the silent-fail.
+export async function verifyPostInPublishedFeed({
+  pageId,
+  postId,
+  token,
+  sinceEpochSec,
+  limit = VERIFY_FEED_LIMIT,
+  fetchImpl = fetch,
+}) {
+  if (!pageId) return { visible: false, error: "pageId required" };
+  if (!postId) return { visible: false, error: "postId required" };
+  const params = new URLSearchParams({
+    fields: "id,permalink_url,created_time",
+    limit: String(limit),
+    access_token: token,
+  });
+  if (sinceEpochSec) params.set("since", String(sinceEpochSec));
+  const url =
+    `https://graph.facebook.com/${GRAPH_VERSION}/${pageId}/published_posts?${params}`;
+  let res;
+  try {
+    res = await fetchWithTimeout(url, {}, HTTP_TIMEOUT_MS, fetchImpl);
+  } catch (err) {
+    return { visible: false, error: `feed fetch: ${err.message}` };
+  }
+  const text = await res.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = { raw: text };
+  }
+  if (!res.ok) {
+    return { visible: false, status: res.status, response: payload };
+  }
+  const posts = Array.isArray(payload?.data) ? payload.data : [];
+  // Facebook returns ids as either the bare numeric or {page}_{post}; match
+  // either side so a bare post_id from the create call lines up with feed rows.
+  const target = String(postId);
+  const tail = target.includes("_") ? target.split("_").pop() : target;
+  const match = posts.find((p) => {
+    if (!p || typeof p.id !== "string") return false;
+    if (p.id === target) return true;
+    const pTail = p.id.includes("_") ? p.id.split("_").pop() : p.id;
+    return pTail === tail;
+  });
+  if (match) {
+    return {
+      visible: true,
+      response: payload,
+      match,
+      permalink_url: match.permalink_url || null,
+      created_time: match.created_time || null,
+      scanned: posts.length,
+    };
+  }
+  return { visible: false, response: payload, scanned: posts.length };
+}
+
+// Polls verification until success or the attempt budget is exhausted. Both
+// the page-feed read-back (THEAAAAA-669, primary) and the post-id read-back
+// (THEAAAAA-668, corroborating permalink) must return visible for a publish to
+// be accepted. Sleep/now are injectable so tests run instantly.
+export async function verifyPostVisibleWithPolling({
+  postId,
+  pageId,
+  token,
+  sinceEpochSec,
+  fetchImpl = fetch,
+  attempts = VERIFY_ATTEMPTS,
+  pollMs = VERIFY_POLL_MS,
+  // windowMs kept for back-compat; if set, overrides attempts via attempt count.
+  windowMs,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  now = () => Date.now(),
+} = {}) {
+  const start = now();
+  const effectiveAttempts = Number.isFinite(windowMs)
+    ? Math.max(1, Math.floor(windowMs / Math.max(1, pollMs)) + 1)
+    : attempts;
+  let last = { visible: false, error: "no attempt" };
+  for (let i = 0; i < effectiveAttempts; i += 1) {
+    const feed = await verifyPostInPublishedFeed({
+      pageId,
+      postId,
+      token,
+      sinceEpochSec,
+      fetchImpl,
+    });
+    if (feed.visible) {
+      // Corroborate with post-id read-back; if it agrees, accept. If it errors
+      // (transient), still accept on feed match alone — the feed is canonical.
+      const direct = await verifyPostVisible({ postId, token, fetchImpl });
+      last = {
+        visible: true,
+        feed,
+        direct,
+        permalink_url: feed.permalink_url || direct.permalink_url || null,
+        created_time: feed.created_time || direct.created_time || null,
+        attempt: i + 1,
+      };
+      return { ...last, elapsedMs: now() - start };
+    }
+    last = { visible: false, feed, attempt: i + 1 };
+    if (i + 1 >= effectiveAttempts) break;
+    await sleep(pollMs);
+  }
+  return { ...last, elapsedMs: now() - start, timedOut: true };
+}
+
 export async function publishPhoto({ pageId, token, imageUrl, message, fetchImpl = fetch }) {
   const url = `https://graph.facebook.com/${GRAPH_VERSION}/${pageId}/photos`;
   const body = new URLSearchParams({ url: imageUrl, message, access_token: token });
@@ -263,6 +426,8 @@ export async function publishRun({
   backoffMs = BACKOFF_MS,
   now = () => Date.now(),
   onFinalFailure = null,
+  verifyWindowMs = VERIFY_WINDOW_MS,
+  verifyPollMs = VERIFY_POLL_MS,
 }) {
   if (!runId) throw new PublishError("runId required", { stage: "load", retryable: false });
   if (!pgClient) throw new PublishError("pgClient required", { stage: "load", retryable: false });
@@ -324,6 +489,7 @@ export async function publishRun({
 
     while (attempt <= MAX_RETRIES) {
       const tBeforeSec = Math.floor(now() / 1000) - CONFIRMATION_WINDOW_SEC;
+      const publishStartSec = Math.floor(now() / 1000);
       try {
         const result = await publishPhoto({
           pageId,
@@ -332,10 +498,76 @@ export async function publishRun({
           message,
           fetchImpl,
         });
+
+        // THEAAAAA-668 / THEAAAAA-669 — Graph read-back. The create-call
+        // post_id is a claim, not proof; THEAAAAA-543 logged a post id that
+        // 404'd and never landed in /{page_id}/published_posts. We confirm
+        // visibility on the page feed (board spec) AND via /{post-id} before
+        // marking the run Published.
+        const verify = await verifyPostVisibleWithPolling({
+          postId: result.fb_post_id,
+          pageId,
+          token,
+          sinceEpochSec: publishStartSec - VERIFY_FEED_LOOKBACK_SEC,
+          fetchImpl,
+          windowMs: verifyWindowMs,
+          pollMs: verifyPollMs,
+          sleep,
+          now,
+        });
+        if (!verify.visible) {
+          await logAttempt(pgClient, {
+            runId,
+            outcome: "publish_unverified",
+            fbResponse: { create: result.raw, verify: verify.response ?? null },
+            error: `read-back failed: ${verify.error || `status ${verify.status || "n/a"}`}`,
+          });
+          await pgClient.query(
+            `UPDATE vep_runs
+                SET publishing_result = 'Publishing Failed',
+                    failure_reason = $2,
+                    retry_count = $3
+              WHERE run_id = $1`,
+            [
+              runId,
+              `post id ${result.fb_post_id} not visible on page feed within ` +
+                `${Math.round(verifyWindowMs / 1000)}s (Graph read-back failed)`,
+              attempt,
+            ],
+          );
+          await pgClient.query("COMMIT");
+          committed = true;
+          if (typeof onFinalFailure === "function") {
+            try {
+              await onFinalFailure({
+                run,
+                error: new PublishError("post id not visible on page feed", {
+                  stage: "verify",
+                  retryable: false,
+                  response: { create: result.raw, verify: verify.response ?? null },
+                }),
+                attempts: attempt + 1,
+              });
+            } catch (hookErr) {
+              console.error("onFinalFailure hook threw:", hookErr.message);
+            }
+          }
+          return {
+            published: false,
+            failed: true,
+            unverified: true,
+            fb_post_id: result.fb_post_id,
+            verify,
+            attempts: attempt + 1,
+            error: "post id not visible on page feed",
+          };
+        }
+
+        const permalink = verify.permalink_url || permalinkFor(result.fb_post_id);
         await logAttempt(pgClient, {
           runId,
           outcome: "success",
-          fbResponse: result.raw,
+          fbResponse: { create: result.raw, verify: verify.response },
         });
         await pgClient.query(
           `UPDATE vep_runs
@@ -345,14 +577,15 @@ export async function publishRun({
                   actual_publication_time = now(),
                   retry_count = $4
             WHERE run_id = $1`,
-          [runId, result.fb_post_id, permalinkFor(result.fb_post_id), attempt],
+          [runId, result.fb_post_id, permalink, attempt],
         );
         await pgClient.query("COMMIT");
         committed = true;
         return {
           published: true,
           fb_post_id: result.fb_post_id,
-          permalink: permalinkFor(result.fb_post_id),
+          permalink,
+          verify,
           attempts: attempt + 1,
         };
       } catch (err) {
