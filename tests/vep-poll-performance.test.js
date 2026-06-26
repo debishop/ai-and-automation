@@ -74,6 +74,30 @@ test("findDueSnapshots queries one row per interval and flattens", async () => {
   assert.equal(pg.calls.length, INTERVALS.length);
 });
 
+test("findDueSnapshots filters to status='published' so cancelled smokes are excluded", async () => {
+  // Simulate DB: one cancelled row + one published row exist with fb_post_id NOT NULL.
+  // The WHERE r.status = 'published' filter must exclude the cancelled row.
+  const pg = makeMockPg([
+    {
+      match: /vep_runs/,
+      respond(sql) {
+        assert.match(sql, /r\.status\s*=\s*'published'/);
+        // Mimic Postgres applying the predicate: cancelled row is dropped, only published returned.
+        return {
+          rows: [
+            { run_id: "published-run", fb_post_id: "POST", actual_publication_time: "t" },
+          ],
+          rowCount: 1,
+        };
+      },
+    },
+  ]);
+  const rows = await findDueSnapshots(pg);
+  for (const r of rows) assert.equal(r.run_id, "published-run");
+  assert.equal(pg.calls.length, INTERVALS.length);
+  for (const c of pg.calls) assert.match(c.sql, /r\.status\s*=\s*'published'/);
+});
+
 test("findDueSnapshots passes WINDOW_SEC", async () => {
   const pg = makeMockPg([{ match: /vep_runs/, respond: () => ({ rows: [], rowCount: 0 }) }]);
   await findDueSnapshots(pg);

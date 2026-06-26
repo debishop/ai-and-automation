@@ -69,7 +69,8 @@ export async function findDueSnapshots(client, { now = new Date(), windowSec = W
          FROM vep_runs r
          LEFT JOIN vep_performance_snapshots s
            ON s.run_id = r.run_id AND s.interval = $1
-        WHERE r.fb_post_id IS NOT NULL
+        WHERE r.status = 'published'
+          AND r.fb_post_id IS NOT NULL
           AND r.actual_publication_time IS NOT NULL
           AND s.snapshot_id IS NULL
           AND ABS(EXTRACT(EPOCH FROM (($2::timestamptz - r.actual_publication_time) - ($3 || ' seconds')::interval))) <= $4`,
